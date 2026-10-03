@@ -1,0 +1,33 @@
+# Přihlašovací údaje — nikdy do repa
+config.json
+stremio.json
+.device.json
+*.token
+
+# Osobní data: historie, knihovna, stav mostu
+tracker.db
+tracker.db-wal
+tracker.db-shm
+*.sqlite
+*.sqlite.tmp
+stremio_library.json
+pushed.json
+gaps.json
+forward.json
+last_*.json
+last_backup.json
+
+# Cache — dá se kdykoli stáhnout znovu
+cinemeta_cache.json
+trakt_episodes_cache.json
+trakt_titles_cache.json
+
+# Lokální zálohy
+backups/
+
+# Python a macOS
+__pycache__/
+*.py[cod]
+.DS_Store
+# roborev snapshots
+/.roborev/

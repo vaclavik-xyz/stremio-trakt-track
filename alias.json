@@ -1,0 +1,4 @@
+{
+  "_note": "Stremio ID -> the ID Trakt uses for the same title, when they differ. Key is the _id from the Stremio library. Copy to alias.json (git-ignored) and edit.",
+  "tt0000001": "tt0000002"
+}

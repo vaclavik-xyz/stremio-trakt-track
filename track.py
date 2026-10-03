@@ -1,0 +1,771 @@
+#!/usr/bin/env python3
+"""Trakt tracker – lokální zrcadlo Trakt historie + přehledy.
+
+Použití:
+  python3 track.py auth            # jednorázové přihlášení (device flow)
+  python3 track.py sync            # stáhne historii/hodnocení/watchlist do tracker.db
+  python3 track.py report          # měsíční přehled (markdown)
+  python3 track.py report --year   # roční přehled
+  python3 track.py status          # co je v DB a kdy se naposledy synchronizovalo
+
+Konfigurace: config.json v této složce (client_id + client_secret, práva 600).
+Token se ukládá do stejného souboru a automaticky se obnovuje.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import pathlib
+import sqlite3
+import stat
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+BASE = "https://api.trakt.tv"
+HERE = pathlib.Path(__file__).resolve().parent
+CONFIG = HERE / "config.json"
+DB = HERE / "tracker.db"
+UA = "stremio-trakt-track/1.0.0"
+
+# ---------------------------------------------------------------- konfigurace
+
+
+def _harden(path: pathlib.Path) -> None:
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+
+
+def load_config() -> dict:
+    if not CONFIG.exists():
+        sys.exit(f"Chybí {CONFIG}. Spusť nejdřív setup_secret.sh.")
+    return json.loads(CONFIG.read_text())
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    _harden(CONFIG)
+
+
+# --------------------------------------------------------------------- HTTP
+
+
+class TraktError(RuntimeError):
+    pass
+
+
+def _req(method: str, path: str, params: dict | None = None,
+         body: dict | None = None, auth: bool = True,
+         cfg: dict | None = None) -> tuple[object, dict]:
+    cfg = cfg or load_config()
+    url = BASE + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": UA,
+        "trakt-api-version": "2",
+        "trakt-api-key": cfg["client_id"],
+    }
+    if auth:
+        headers["Authorization"] = "Bearer " + access_token()
+    data = json.dumps(body).encode() if body is not None else None
+
+    for attempt in range(4):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+                payload = json.loads(raw) if raw else None
+                # Trakt posílá hlavičky malými písmeny → normalizuj klíče
+                return payload, {k.lower(): v for k, v in resp.headers.items()}
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            detail = raw[:300].decode(errors="replace")
+            if e.code == 429:
+                wait = int(e.headers.get("Retry-After") or 2)
+                print(f"  rate limit, čekám {wait}s…", file=sys.stderr)
+                time.sleep(wait + 1)
+                continue
+            if e.code == 423:
+                raise TraktError("Účet je zamčený – spusť history analysis na trakt.tv/settings/data.") from None
+            if e.code == 426:
+                raise TraktError("Tahle metoda je VIP-only.") from None
+            raise TraktError(f"{method} {path} -> HTTP {e.code}: {detail}") from None
+        except urllib.error.URLError as e:
+            raise TraktError(f"Síťová chyba u {path}: {e.reason}") from None
+    raise TraktError(f"{method} {path}: rate limit se nevyřešil")
+
+
+def _token_expired(cfg: dict) -> bool:
+    tok = cfg.get("token") or {}
+    expires = tok.get("expires_at", 0)
+    return time.time() > (expires - 86400)  # obnov den předem
+
+
+def access_token() -> str:
+    cfg = load_config()
+    tok = cfg.get("token") or {}
+    if not tok.get("access_token"):
+        sys.exit("Nejsi přihlášený. Spusť: python3 track.py auth")
+    if _token_expired(cfg):
+        try:
+            refresh_token()
+        except TraktError as e:
+            sys.exit(f"Token vypršel a obnovení selhalo ({e}).\nSpusť znovu: python3 track.py auth")
+        cfg = load_config()
+        tok = cfg.get("token") or {}
+    return tok["access_token"]
+
+
+def refresh_token() -> None:
+    cfg = load_config()
+    tok = cfg.get("token") or {}
+    body = {
+        "grant_type": "refresh_token",
+        "refresh_token": tok.get("refresh_token"),
+        "client_id": cfg["client_id"],
+        "redirect_uri": cfg.get("redirect_uri") or "urn:ietf:wg:oauth:2.0:oob",
+    }
+    if cfg.get("client_secret"):
+        body["client_secret"] = cfg["client_secret"]
+    payload, _ = _req("POST", "/oauth/token", body=body, auth=False, cfg=cfg)
+    store_token(cfg, payload)
+    print("Token obnoven.")
+
+
+def store_token(cfg: dict, payload: dict) -> None:
+    expires_in = int(payload.get("expires_in") or 7776000)
+    cfg["token"] = {
+        "access_token": payload["access_token"],
+        "refresh_token": payload.get("refresh_token"),
+        "expires_at": int(time.time()) + expires_in,
+        "created_at": payload.get("created_at") or dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    save_config(cfg)
+
+
+# --------------------------------------------------------------------- auth
+
+
+def cmd_auth(_args: argparse.Namespace) -> None:
+    cfg = load_config()
+    payload, _ = _req("POST", "/oauth/device/code",
+                      body={"client_id": cfg["client_id"]}, auth=False, cfg=cfg)
+    code = payload["user_code"]
+    url = payload.get("verification_url", "https://trakt.tv/activate")
+    interval = int(payload.get("interval") or 5)
+    expires = int(payload.get("expires_in") or 600)
+
+    print("=" * 58, flush=True)
+    print(f"  1) Otevři {url}", flush=True)
+    print(f"  2) Zadej kód:  {code}", flush=True)
+    print(f"  3) Potvrď aplikaci.  (kód platí {expires // 60} minut)", flush=True)
+    print("=" * 58, flush=True)
+    print("Čekám na potvrzení…", flush=True)
+
+    device_code = payload["device_code"]
+    (HERE / ".device.json").write_text(json.dumps(
+        {"user_code": code, "verification_url": url,
+         "expires_at": int(time.time()) + expires}, indent=2), encoding="utf-8")
+    deadline = time.time() + expires
+    while time.time() < deadline:
+        time.sleep(interval)
+        try:
+            body = {"code": device_code, "client_id": cfg["client_id"]}
+            if cfg.get("client_secret"):
+                body["client_secret"] = cfg["client_secret"]
+            tok, _ = _req("POST", "/oauth/device/token", body=body, auth=False, cfg=cfg)
+        except TraktError as e:
+            msg = str(e)
+            if "HTTP 400" in msg:      # ještě nepotvrzeno
+                continue
+            if "HTTP 429" in msg:
+                interval += 1
+                continue
+            if "HTTP 410" in msg:
+                sys.exit("Kód vypršel. Spusť auth znovu.")
+            if "HTTP 418" in msg:
+                sys.exit("Potvrzení zamítnuto na trakt.tv.")
+            if "HTTP 409" in msg:
+                sys.exit("Kód už byl použit. Spusť auth znovu.")
+            raise
+        store_token(cfg, tok)
+        print("Hotovo – přihlášeno. Teď můžeš spustit: python3 track.py sync")
+        return
+    sys.exit("Kód vypršel. Spusť auth znovu.")
+
+
+# --------------------------------------------------------------------- sync
+
+
+def paged(path: str, params: dict | None = None) -> list:
+    """Projde všechny stránky a vrátí spojený seznam."""
+    out: list = []
+    page = 1
+    while True:
+        p = dict(params or {})
+        p.update({"page": page, "limit": 100})
+        payload, headers = _req("GET", path, params=p)
+        if isinstance(payload, list):
+            out.extend(payload)
+        else:
+            return [payload] if payload else []
+        pages = int(headers.get("x-pagination-page-count") or 0)
+        if (pages and page >= pages) or len(payload) < p["limit"]:
+            return out
+        page += 1
+
+
+DDL = """
+CREATE TABLE IF NOT EXISTS watched_movies(
+  history_id INTEGER PRIMARY KEY, trakt_id INTEGER, title TEXT, year INTEGER,
+  watched_at TEXT, action TEXT, imdb TEXT, tmdb TEXT, runtime INTEGER);
+CREATE TABLE IF NOT EXISTS watched_episodes(
+  history_id INTEGER PRIMARY KEY, show_id INTEGER, show_title TEXT,
+  season INTEGER, episode INTEGER, ep_title TEXT, watched_at TEXT,
+  action TEXT, runtime INTEGER);
+CREATE TABLE IF NOT EXISTS ratings(
+  kind TEXT, trakt_id INTEGER, title TEXT, season INTEGER, episode INTEGER,
+  rating INTEGER, rated_at TEXT,
+  PRIMARY KEY (kind, trakt_id, season, episode));
+CREATE TABLE IF NOT EXISTS watchlist(
+  kind TEXT, trakt_id INTEGER, title TEXT, year INTEGER, listed_at TEXT,
+  PRIMARY KEY (kind, trakt_id));
+CREATE TABLE IF NOT EXISTS shows_progress(
+  trakt_id INTEGER PRIMARY KEY, title TEXT, aired INTEGER, completed INTEGER,
+  last_watched_at TEXT, next_season INTEGER, next_number INTEGER, next_title TEXT,
+  hidden_seasons TEXT);
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+"""
+
+
+def db() -> sqlite3.Connection:
+    con = sqlite3.connect(DB)
+    con.executescript(DDL)
+    # NULL v primárním klíči nefunguje jako rovnost → sjednoť na -1 a zahoď duplicity
+    con.execute("DELETE FROM ratings WHERE rowid NOT IN (SELECT MIN(rowid) FROM ratings "
+                "GROUP BY kind, trakt_id, COALESCE(season,-1), COALESCE(episode,-1))")
+    con.execute("UPDATE ratings SET season=COALESCE(season,-1), episode=COALESCE(episode,-1)")
+    return con
+
+
+def set_meta(con: sqlite3.Connection, key: str, value: str) -> None:
+    con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, value))
+
+
+def _prune(con: sqlite3.Connection, table: str, column: str, live: set, label: str) -> None:
+    """Zrcadlo, ne hromada: co v Traktu už není, nesmí zůstat v DB.
+
+    Bez toho by lokální přehledy počítaly i záznamy, které uživatel v Traktu smazal
+    (a co most omylem doplní dvakrát, by se počítalo dvakrát).
+    """
+    stale = [r[0] for r in con.execute(f"SELECT {column} FROM {table}").fetchall()
+             if r[0] not in live]
+    if stale:
+        con.executemany(f"DELETE FROM {table} WHERE {column}=?", [(i,) for i in stale])
+        print(f"  smazáno {len(stale)} záznamů, které v Traktu už nejsou ({label})")
+
+
+def cmd_sync(_args: argparse.Namespace) -> None:
+    con = db()
+    cfg = load_config()
+
+    me = _req("GET", "/users/me")[0]
+    user = me.get("username")
+    print(f"Účet: {user}")
+
+    print("Historie filmů…")
+    movies = paged("/sync/history/movies", {"extended": "full"})
+    for it in movies:
+        m = it.get("movie") or {}
+        con.execute(
+            "INSERT OR REPLACE INTO watched_movies VALUES(?,?,?,?,?,?,?,?,?)",
+            (it.get("id"), m.get("ids", {}).get("trakt"), m.get("title"), m.get("year"),
+             it.get("watched_at"), it.get("action"),
+             m.get("ids", {}).get("imdb"), m.get("ids", {}).get("tmdb"), m.get("runtime")))
+    print(f"  {len(movies)} záznamů")
+    _prune(con, "watched_movies", "history_id", {it.get("id") for it in movies}, "filmů")
+
+    print("Historie epizod…")
+    eps = paged("/sync/history/episodes", {"extended": "full"})
+    for it in eps:
+        ep = it.get("episode") or {}
+        show = it.get("show") or {}
+        con.execute(
+            "INSERT OR REPLACE INTO watched_episodes VALUES(?,?,?,?,?,?,?,?,?)",
+            (it.get("id"), show.get("ids", {}).get("trakt"), show.get("title"),
+             ep.get("season"), ep.get("number"), ep.get("title"), it.get("watched_at"),
+             it.get("action"), ep.get("runtime")))
+    print(f"  {len(eps)} záznamů")
+    _prune(con, "watched_episodes", "history_id", {it.get("id") for it in eps}, "epizod")
+
+    print("Hodnocení…")
+    total = 0
+    seen_ratings: set = set()
+    ratings_complete = True
+    for kind, path in (("movie", "/sync/ratings/movies"), ("show", "/sync/ratings/shows"),
+                       ("season", "/sync/ratings/seasons"), ("episode", "/sync/ratings/episodes")):
+        try:
+            items = paged(path)
+        except TraktError as e:
+            print(f"  {kind}: přeskočeno ({e})")
+            ratings_complete = False
+            continue
+        for it in items:
+            obj = it.get(kind) or it.get("movie") or it.get("show") or it.get("episode") or {}
+            if kind == "season":
+                show = it.get("show") or {}
+                con.execute("INSERT OR REPLACE INTO ratings VALUES(?,?,?,?,?,?,?)",
+                            (kind, show.get("ids", {}).get("trakt"), show.get("title"),
+                             obj.get("number"), -1, it.get("rating"), it.get("rated_at")))
+                seen_ratings.add((kind, show.get("ids", {}).get("trakt"), obj.get("number"), -1))
+            elif kind == "episode":
+                show = it.get("show") or {}
+                con.execute("INSERT OR REPLACE INTO ratings VALUES(?,?,?,?,?,?,?)",
+                            (kind, show.get("ids", {}).get("trakt"), show.get("title"),
+                             obj.get("season"), obj.get("number"), it.get("rating"), it.get("rated_at")))
+                seen_ratings.add((kind, show.get("ids", {}).get("trakt"), obj.get("season"), obj.get("number")))
+            else:
+                con.execute("INSERT OR REPLACE INTO ratings VALUES(?,?,?,?,?,?,?)",
+                            (kind, obj.get("ids", {}).get("trakt"), obj.get("title"),
+                             -1, -1, it.get("rating"), it.get("rated_at")))
+                seen_ratings.add((kind, obj.get("ids", {}).get("trakt"), -1, -1))
+            total += 1
+    print(f"  {total} hodnocení")
+    if ratings_complete:
+        stale = [tuple(r) for r in con.execute(
+            "SELECT kind, trakt_id, season, episode FROM ratings").fetchall()
+            if tuple(r) not in seen_ratings]
+        if stale:
+            con.executemany("DELETE FROM ratings WHERE kind=? AND trakt_id=? AND season=? AND episode=?",
+                            stale)
+            print(f"  smazáno {len(stale)} hodnocení, která v Traktu už nejsou")
+
+    print("Watchlist…")
+    wl = 0
+    seen_wl: set = set()
+    wl_complete = True
+    for kind, path in (("movie", "/sync/watchlist/movies"), ("show", "/sync/watchlist/shows")):
+        try:
+            items = paged(path, {"extended": "full"})
+        except TraktError as e:
+            print(f"  {kind}: přeskočeno ({e})")
+            wl_complete = False
+            continue
+        for it in items:
+            obj = it.get(kind) or {}
+            con.execute("INSERT OR REPLACE INTO watchlist VALUES(?,?,?,?,?)",
+                        (kind, obj.get("ids", {}).get("trakt"), obj.get("title"),
+                         obj.get("year"), it.get("listed_at")))
+            seen_wl.add((kind, obj.get("ids", {}).get("trakt")))
+            wl += 1
+    print(f"  {wl} položek")
+    if wl_complete:
+        stale = [tuple(r) for r in con.execute("SELECT kind, trakt_id FROM watchlist").fetchall()
+                 if tuple(r) not in seen_wl]
+        if stale:
+            con.executemany("DELETE FROM watchlist WHERE kind=? AND trakt_id=?", stale)
+            print(f"  smazáno {len(stale)} položek watchlistu, které v Traktu už nejsou")
+
+    print("Postup u seriálů…")
+    shows = paged("/users/me/watched/shows", {"extended": "noseasons"})
+    for i, it in enumerate(shows, 1):
+        show = it.get("show") or {}
+        sid = show.get("ids", {}).get("trakt")
+        try:
+            pr = _req("GET", f"/shows/{sid}/progress/watched",
+                      params={"hidden": "false", "specials": "true"})[0]
+        except TraktError as e:
+            print(f"  ! {show.get('title')}: {e}")
+            continue
+        nxt = pr.get("next_episode") or {}
+        con.execute("INSERT OR REPLACE INTO shows_progress VALUES(?,?,?,?,?,?,?,?,?)",
+                    (sid, show.get("title"), pr.get("aired"), pr.get("completed"),
+                     it.get("last_watched_at"), nxt.get("season"), nxt.get("number"),
+                     nxt.get("title"), json.dumps(pr.get("hidden_seasons") or [])))
+        if i % 25 == 0:
+            print(f"  … {i}/{len(shows)}")
+    print(f"  {len(shows)} seriálů")
+    _prune(con, "shows_progress", "trakt_id",
+           {(it.get("show") or {}).get("ids", {}).get("trakt") for it in shows}, "seriálů")
+
+    stats = _req("GET", "/users/me/stats")[0]
+    set_meta(con, "stats", json.dumps(stats))
+    set_meta(con, "username", user or "")
+    set_meta(con, "synced_at", dt.datetime.now().astimezone().isoformat(timespec="seconds"))
+    con.commit()
+    con.close()
+    print("Synchronizováno.")
+
+
+# ------------------------------------------------------------------ report
+
+
+def parse_when(iso: str | None) -> dt.datetime | None:
+    if not iso:
+        return None
+    try:
+        return dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return None
+
+
+def cn(n: int, one: str, few: str, many: str) -> str:
+    """České počítání: 1 film, 2–4 filmy, 5+ filmů."""
+    if n == 1:
+        return f"{n} {one}"
+    if 2 <= n <= 4:
+        return f"{n} {few}"
+    return f"{n} {many}"
+
+
+def cmd_report(args: argparse.Namespace) -> None:
+    if getattr(args, "all", False):
+        return cmd_report_all(args)
+    con = db()
+    row = con.execute("SELECT value FROM meta WHERE key='synced_at'").fetchone()
+    synced = row[0] if row else "nikdy"
+    row = con.execute("SELECT value FROM meta WHERE key='username'").fetchone()
+    who = row[0] if row else "?"
+
+    today = dt.datetime.now().astimezone()
+    if args.year:
+        start = dt.datetime(today.year, 1, 1, tzinfo=today.tzinfo)
+        end = dt.datetime(today.year + 1, 1, 1, tzinfo=today.tzinfo)
+        label = f"rok {today.year}"
+    else:
+        ym = args.month or today.strftime("%Y-%m")
+        y, m = (int(x) for x in ym.split("-"))
+        start = dt.datetime(y, m, 1, tzinfo=today.tzinfo)
+        end = dt.datetime(y + (m == 12), (m % 12) + 1, 1, tzinfo=today.tzinfo)
+        label = f"{ym}"
+
+    lo, hi = start.isoformat(), end.isoformat()
+    movies = con.execute(
+        "SELECT title, year, watched_at FROM watched_movies WHERE watched_at>=? AND watched_at<? "
+        "ORDER BY watched_at", (lo, hi)).fetchall()
+    eps = con.execute(
+        "SELECT show_title, season, episode, ep_title, watched_at, runtime FROM watched_episodes "
+        "WHERE watched_at>=? AND watched_at<? ORDER BY watched_at", (lo, hi)).fetchall()
+    rts = con.execute(
+        "SELECT kind, title, season, episode, rating FROM ratings WHERE rated_at>=? AND rated_at<? "
+        "GROUP BY kind, title, season, episode ORDER BY MAX(rated_at)", (lo, hi)).fetchall()
+
+    minutes = sum((e[5] or 0) for e in eps)
+    movies_min = 0
+    if movies:
+        mm = con.execute("SELECT SUM(runtime) FROM watched_movies WHERE watched_at>=? AND watched_at<?",
+                         (lo, hi)).fetchone()[0]
+        movies_min = mm or 0
+    minutes += movies_min
+
+    print(f"## Přehled sledování — {label}")
+    print()
+    print(f"*účet {who}, data k {synced}*")
+    print()
+    print(f"- **{cn(len(movies), 'film', 'filmy', 'filmů')}** a "
+          f"**{cn(len(eps), 'epizoda', 'epizody', 'epizod')}**")
+    if minutes:
+        print(f"- celkem cca **{minutes // 60} h {minutes % 60} min**")
+    if movies or eps:
+        days = set()
+        for _, _, d in movies:
+            p = parse_when(d)
+            if p:
+                days.add(p.date())
+        for e in eps:
+            p = parse_when(e[4])
+            if p:
+                days.add(p.date())
+        print(f"- koukáno {len(days)} dní")
+    print()
+
+    if movies:
+        print("### Filmy")
+        agg: dict[tuple, list] = {}
+        for title, year, when in movies:
+            agg.setdefault((title, year), []).append(when)
+        for (title, year), whens in agg.items():
+            days = sorted(p for p in (parse_when(w) for w in whens) if p)
+            first = days[0].strftime("%-d. %-m.") if days else "?"
+            if len(days) > 1:
+                cnt = f" — {len(days)}× ({days[-1].strftime('%-d. %-m.')} naposled)"
+            elif len(whens) > 1:
+                cnt = f" — {len(whens)}×"
+            else:
+                cnt = ""
+            print(f"- {first} — **{title}** ({year}){cnt}")
+        print()
+
+    if eps:
+        print("### Seriály")
+        by_show: dict[str, list] = {}
+        for show, s, e, et, when, rt in eps:
+            by_show.setdefault(show, []).append((s, e, et, when))
+        for show, items in sorted(by_show.items(), key=lambda kv: -len(kv[1])):
+            seasons = sorted({s for s, _, _, _ in items})
+            first = min((parse_when(w) for *_, w in items if parse_when(w)), default=None)
+            last = max((parse_when(w) for *_, w in items if parse_when(w)), default=None)
+            span = ""
+            if first and last:
+                span = f", {first.strftime('%-d.%-m.')}–{last.strftime('%-d.%-m.')}" if first.date() != last.date() else f", {first.strftime('%-d.%-m.')}"
+            sea = f"S{','.join(str(s) for s in seasons)}" if seasons != [0] else "speciály"
+            print(f"- **{show}** — {cn(len(items), 'epizoda', 'epizody', 'epizod')} ({sea}{span})")
+        print()
+
+    unfinished = con.execute(
+        "SELECT title, aired, completed, last_watched_at, next_season, next_number, next_title "
+        "FROM shows_progress WHERE completed < aired AND aired > 0 "
+        "ORDER BY last_watched_at DESC LIMIT 12").fetchall()
+    if unfinished:
+        print("### Kde jsme skončili")
+        for title, aired, completed, lw, ns, nn, nt in unfinished:
+            nxt = f" → S{ns}E{nn}" if ns else ""
+            nts = f" „{nt}“" if nt else ""
+            p = parse_when(lw)
+            when = f", naposledy {p.strftime('%-d. %-m.')}" if p else ""
+            print(f"- **{title}** — {completed}/{aired} zhlédnuto{nxt}{nts}{when}")
+        print()
+
+    if rts:
+        print("### Hodnocení")
+        for kind, title, s, e, rating in rts:
+            extra = ""
+            if kind == "episode":
+                extra = f" S{s}E{e}"
+            elif kind == "season":
+                extra = f" S{s}"
+            print(f"- {rating}/10 — {title}{extra} ({kind})")
+        print()
+
+    print("---")
+    print("Vygenerováno lokálním trackerem z `tracker.db`.")
+    con.close()
+
+
+def cmd_report_all(_args: argparse.Namespace) -> None:
+    """Celoživotní přehled z tracker.db.
+
+    Trakt `/users/me/stats` vrací u tohohle účtu null, takže se všechno počítá
+    z historie: počty záznamů, unikátní tituly, hodiny (z runtime jednotlivých
+    záznamů), dny a roky.
+    """
+    con = db()
+    row = con.execute("SELECT value FROM meta WHERE key='synced_at'").fetchone()
+    synced = row[0] if row else "nikdy"
+    row = con.execute("SELECT value FROM meta WHERE key='username'").fetchone()
+    who = row[0] if row else "?"
+
+    mv = con.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT title || '|' || COALESCE(year, 0)), "
+        "MIN(watched_at) FILTER (WHERE watched_at >= '2000-01-01'), "
+        "MAX(watched_at) FILTER (WHERE watched_at >= '2000-01-01'), "
+        "SUM(runtime) FROM watched_movies").fetchone()
+    ep = con.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT show_title || '|' || season || '|' || episode), "
+        "MIN(watched_at) FILTER (WHERE watched_at >= '2000-01-01'), "
+        "MAX(watched_at) FILTER (WHERE watched_at >= '2000-01-01'), "
+        "SUM(runtime) FROM watched_episodes").fetchone()
+    minutes = int(mv[4] or 0) + int(ep[4] or 0)
+
+    dated = con.execute(
+        "SELECT COUNT(*) FROM watched_movies WHERE watched_at >= '2000-01-01'").fetchone()[0]
+    dated += con.execute(
+        "SELECT COUNT(*) FROM watched_episodes WHERE watched_at >= '2000-01-01'").fetchone()[0]
+    undated = (mv[0] + ep[0]) - dated
+    days = con.execute(
+        "SELECT COUNT(*) FROM (SELECT DISTINCT substr(watched_at, 1, 10) d FROM ("
+        "  SELECT watched_at FROM watched_movies WHERE watched_at >= '2000-01-01'"
+        "  UNION ALL SELECT watched_at FROM watched_episodes WHERE watched_at >= '2000-01-01'))"
+    ).fetchone()[0]
+
+    print(f"## Celoživotní přehled — účet {who}")
+    print()
+    print(f"*data k {synced}*")
+    print()
+    print(f"- **{cn(mv[1], 'film', 'filmy', 'filmů')}** ({mv[0]} záznamů) a "
+          f"**{cn(ep[0], 'epizoda', 'epizody', 'epizod')}**")
+    print(f"- celkem cca **{minutes // 60} h {minutes % 60} min**")
+    starts = [x for x in (parse_when(mv[2]), parse_when(ep[2])) if x]
+    ends = [x for x in (parse_when(mv[3]), parse_when(ep[3])) if x]
+    p1 = min(starts) if starts else None
+    p2 = max(ends) if ends else None
+    if p1 and p2:
+        print(f"- od {p1.strftime('%-d. %-m. %Y')} do {p2.strftime('%-d. %-m. %Y')}, "
+              f"koukáno {days} dní")
+    if undated:
+        print(f"- {undated} záznamů bez data (sledováno, ale neví se kdy — Trakt je vede k 1. 1. 1970)")
+    print()
+
+    print("### Podle let")
+    years: dict[str, list[int]] = {}
+    for y, m, e, mm, me in con.execute("""
+            SELECT y, SUM(f), SUM(e), SUM(fm), SUM(em) FROM (
+              SELECT substr(watched_at, 1, 4) y, COUNT(*) f, 0 e,
+                     COALESCE(SUM(runtime), 0) fm, 0 em FROM watched_movies GROUP BY 1
+              UNION ALL
+              SELECT substr(watched_at, 1, 4), 0, COUNT(*), 0, COALESCE(SUM(runtime), 0)
+                FROM watched_episodes GROUP BY 1
+            ) GROUP BY y ORDER BY y"""):
+        years[y] = [m, e, int(mm or 0) + int(me or 0)]
+    undated_years = [0, 0, 0]
+    real_years: list[tuple] = []
+    for y, (m, e, mins) in years.items():
+        if not y or y < "2000":
+            undated_years = [undated_years[0] + m, undated_years[1] + e, undated_years[2] + mins]
+        else:
+            real_years.append((y, m, e, mins))
+    if undated_years[0] or undated_years[1]:
+        print(f"- **bez data**: {undated_years[0]} filmů, {undated_years[1]} epizod, "
+              f"cca {undated_years[2] // 60} h")
+    for y, m, e, mins in sorted(real_years):
+        print(f"- **{y}**: {m} filmů, {e} epizod, cca {mins // 60} h")
+    print()
+
+    print("### Nejvíc zhlédnuté seriály")
+    for t, n in con.execute(
+            "SELECT show_title, COUNT(DISTINCT season || '|' || episode) FROM watched_episodes "
+            "GROUP BY show_title ORDER BY 2 DESC LIMIT 10"):
+        print(f"- **{t}** — {cn(n, 'díl', 'díly', 'dílů')}")
+    print()
+
+    print("### Filmy víckrát")
+    for t, n in con.execute("SELECT title, COUNT(*) FROM watched_movies GROUP BY title "
+                            "HAVING COUNT(*) > 1 ORDER BY 2 DESC LIMIT 8"):
+        print(f"- **{t}** — {n}×")
+    print()
+
+    done = con.execute("SELECT COUNT(*) FROM shows_progress WHERE completed >= aired AND aired > 0").fetchone()[0]
+    total_shows = con.execute("SELECT COUNT(*) FROM shows_progress").fetchone()[0]
+    finished = con.execute("SELECT title, completed FROM shows_progress "
+                           "WHERE completed >= aired AND aired > 0 ORDER BY completed DESC LIMIT 5").fetchall()
+    print(f"### Seriály: {total_shows} rozkoukaných, {done} dokoukaných")
+    for t, c in finished:
+        print(f"- **{t}** — {cn(c, 'díl', 'díly', 'dílů')}")
+    print()
+    print("---")
+    print("Vygenerováno lokálním trackerem z `tracker.db`.")
+    con.close()
+
+
+def cmd_status(_args: argparse.Namespace) -> None:
+    con = db()
+    for table, label in (("watched_movies", "filmy"), ("watched_episodes", "epizody"),
+                         ("ratings", "hodnocení"), ("watchlist", "watchlist"),
+                         ("shows_progress", "seriály")):
+        n = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        print(f"{label:12s} {n}")
+    row = con.execute("SELECT value FROM meta WHERE key='synced_at'").fetchone()
+    print(f"naposledy sync: {row[0] if row else 'nikdy'}")
+    con.close()
+
+
+def cmd_watchtime(args: argparse.Namespace) -> None:
+    """Kolik času jsem u sledování strávil — co je v datech a jaký je odhad za život.
+
+    Počítá se z `runtime` jednotlivých záznamů (Trakt ho dává u filmů i epizod).
+    Filmy zatržené ručně v jednom termínu (stejná minuta) se hlásí zvlášť — v datech
+    vypadají jako sledované ten den, ale skutečný čas sledování nezná.
+    Odhad za život je jen počítadlo s parametry, které si zadáš: `--from-year`
+    a `--hours-per-day`. Z dat se vzít nedá, pre-Trakt roky v žádném zdroji nejsou.
+    """
+    con = db()
+    mv = list(con.execute("SELECT title, watched_at, runtime FROM watched_movies"))
+    ep = list(con.execute("SELECT show_title, watched_at, runtime FROM watched_episodes"))
+    tot_m = sum(r[2] or 0 for r in mv)
+    tot_e = sum(r[2] or 0 for r in ep)
+    tot = tot_m + tot_e
+
+    def hm(m: int) -> str:
+        return f"{m // 60} h {m % 60} min"
+
+    def num(x: float, dec: int = 1) -> str:
+        return f"{x:.{dec}f}".replace(".", ",")
+
+    print("## Kolik času u sledování")
+    print()
+    print(f"- celkem **{hm(tot)}** — {num(tot / 1440)} dne, {num(tot / 1440 / 365.25, 2)} roku "
+          "čistého času")
+    print(f"- seriály: **{hm(tot_e)}** ({len(ep)} dílů) · filmy: **{hm(tot_m)}** "
+          f"({len(mv)} zhlédnutí)")
+    print()
+
+    years: dict[str, int] = {}
+    for _t, w, rt in mv + ep:
+        y = w[:4] if (w or "") >= "2000" else "bez data"
+        years[y] = years.get(y, 0) + (rt or 0)
+    print("### Podle let")
+    for y in sorted(years, key=lambda y: (y == "bez data", y)):
+        share = 100 * years[y] / tot if tot else 0
+        label = f"**{y}**" if y != "bez data" else "**bez data**"
+        print(f"- {label}: {hm(years[y])} ({num(share, 0)} %)")
+    print()
+
+    hours: dict[str, int] = {}
+    for t, _w, rt in mv + ep:
+        hours[t] = hours.get(t, 0) + (rt or 0)
+    print("### Nejvíc hodin podle titulu")
+    for t, m in sorted(hours.items(), key=lambda kv: -kv[1])[:10]:
+        print(f"- {t} — {hm(m)}")
+    print()
+
+    batches: dict[str, list[str]] = {}
+    for t, w, _rt in mv:
+        if (w or "") >= "2000":
+            batches.setdefault(w[:16], []).append(t)
+    batches = {k: v for k, v in batches.items() if len(v) > 1}
+    n_batch = sum(len(v) for v in batches.values())
+    if batches:
+        print(f"### Filmy zatržené ručně, ne odsledované ({n_batch} z {len(mv)})")
+        print()
+        print("U těchto záznamů je datum nespolehlivé — vznikly označením „viděno“ "
+              "v jedné chvíli, ne sledováním:")
+        for k, v in sorted(batches.items()):
+            print(f"- {k.replace('T', ' ')} — {', '.join(v)}")
+        print()
+
+    from_year = args.from_year
+    per_day = args.hours_per_day
+    now = dt.date.today()
+    span_years = (now - dt.date(from_year, 1, 1)).days / 365.25
+    est = span_years * 365.25 * per_day
+    print(f"### Odhad za život (jen počítadlo, ne data)")
+    print()
+    print(f"Od roku {from_year} do dnes je {num(span_years)} roku. Při průměru "
+          f"**{num(per_day)} h/den** to dělá **{est:.0f} h** = {est / 24:.0f} dní = "
+          f"**{num(est / 24 / 365.25, 2)} roku** čistého času "
+          f"({num(100 * est / (span_years * 365.25 * 24))} % z toho období).")
+    print()
+    print("Změň parametry, číslo se přepočítá: `track.py watchtime --from-year 2010 "
+          "--hours-per-day 1.5`.")
+    con.close()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Trakt tracker")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("auth", help="přihlášení přes device flow").set_defaults(func=cmd_auth)
+    sub.add_parser("sync", help="stáhne data z Traktu do tracker.db").set_defaults(func=cmd_sync)
+    rp = sub.add_parser("report", help="vygeneruje přehled")
+    rp.add_argument("--month", help="YYYY-MM (výchozí: tento měsíc)")
+    rp.add_argument("--year", action="store_true", help="celý letošní rok")
+    rp.add_argument("--all", action="store_true", help="celoživotní přehled")
+    rp.set_defaults(func=cmd_report)
+    sub.add_parser("status", help="stav databáze").set_defaults(func=cmd_status)
+    wt = sub.add_parser("watchtime", help="kolik času u sledování (a odhad za život)")
+    wt.add_argument("--from-year", type=int, default=2005, help="od kterého roku počítat odhad")
+    wt.add_argument("--hours-per-day", type=float, default=2.0, help="průměr h/den do odhadu")
+    wt.set_defaults(func=cmd_watchtime)
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
