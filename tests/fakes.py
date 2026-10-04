@@ -27,6 +27,11 @@ class FakeTrakt:
             raise val
         if callable(val):
             val = val(body, params)
+        if isinstance(val, list) and params and "page" in params:
+            # like Trakt: serve pages and say how many there are
+            page, limit = int(params["page"]), int(params.get("limit") or 10)
+            pages = max(1, -(-len(val) // limit))
+            return val[(page - 1) * limit:page * limit], {"x-pagination-page-count": str(pages)}
         return val, {}
 
     def posts(self):

@@ -252,37 +252,89 @@ CREATE TABLE IF NOT EXISTS shows_progress(
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 """
 
+# Historie je archiv: co z Traktu zmizí, se jen označí `deleted_at` a přehledy
+# čtou pohledy live_*. Smazané řádky zůstávají jako doklad a dají se vrátit.
+VIEWS = """
+CREATE VIEW IF NOT EXISTS live_movies AS SELECT * FROM watched_movies WHERE deleted_at IS NULL;
+CREATE VIEW IF NOT EXISTS live_episodes AS SELECT * FROM watched_episodes WHERE deleted_at IS NULL;
+"""
 
-def db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB)
+MOVIE_COLS = "history_id, trakt_id, title, year, watched_at, action, imdb, tmdb, runtime"
+EPISODE_COLS = ("history_id, show_id, show_title, season, episode, ep_title, watched_at, "
+                "action, runtime")
+
+
+def db(path: pathlib.Path | None = None) -> sqlite3.Connection:
+    con = sqlite3.connect(path or DB)
     con.executescript(DDL)
-    # NULL v primárním klíči nefunguje jako rovnost → sjednoť na -1 a zahoď duplicity
-    con.execute("DELETE FROM ratings WHERE rowid NOT IN (SELECT MIN(rowid) FROM ratings "
-                "GROUP BY kind, trakt_id, COALESCE(season,-1), COALESCE(episode,-1))")
-    con.execute("UPDATE ratings SET season=COALESCE(season,-1), episode=COALESCE(episode,-1)")
+    _migrate(con)
     return con
+
+
+def _migrate(con: sqlite3.Connection) -> None:
+    for table in ("watched_movies", "watched_episodes"):
+        cols = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+        if "deleted_at" not in cols:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN deleted_at TEXT")
+    con.executescript(VIEWS)
+    if con.execute("PRAGMA user_version").fetchone()[0] < 1:
+        # NULL v primárním klíči nefunguje jako rovnost → sjednoť na -1 a zahoď duplicity
+        con.execute("DELETE FROM ratings WHERE rowid NOT IN (SELECT MIN(rowid) FROM ratings "
+                    "GROUP BY kind, trakt_id, COALESCE(season,-1), COALESCE(episode,-1))")
+        con.execute("UPDATE ratings SET season=COALESCE(season,-1), episode=COALESCE(episode,-1)")
+        con.execute("PRAGMA user_version = 1")
+    con.commit()
 
 
 def set_meta(con: sqlite3.Connection, key: str, value: str) -> None:
     con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, value))
 
 
-def _prune(con: sqlite3.Connection, table: str, column: str, live: set, label: str) -> None:
-    """Zrcadlo, ne hromada: co v Traktu už není, nesmí zůstat v DB.
+class PruneRefused(Exception):
+    pass
 
-    Bez toho by lokální přehledy počítaly i záznamy, které uživatel v Traktu smazal
-    (a co most omylem doplní dvakrát, by se počítalo dvakrát).
+
+def _prune(con: sqlite3.Connection, table: str, column: str, live: set, label: str,
+           *, soft: bool, allow_mass: bool = False) -> int:
+    """Zrcadlo, ne hromada: co v Traktu už není, nesmí se počítat v přehledech.
+
+    Historie (`soft=True`) se jen označí `deleted_at`, ostatní se maže. Když by
+    zmizelo víc než `prune_max_rows` řádků a zároveň víc než `prune_max_fraction`
+    tabulky, je to spíš výpadek nebo chyba Traktu než úklid → PruneRefused
+    (sync pak skončí s EXIT_GUARD a cron to ohlásí). `--allow-mass-delete` projde.
     """
-    stale = [r[0] for r in con.execute(f"SELECT {column} FROM {table}").fetchall()
-             if r[0] not in live]
-    if stale:
+    where = " WHERE deleted_at IS NULL" if soft else ""
+    rows = [r[0] for r in con.execute(f"SELECT {column} FROM {table}{where}").fetchall()]
+    stale = [x for x in rows if x not in live]
+    if not stale:
+        return 0
+    st = common.settings()
+    if (not allow_mass and len(stale) > st["prune_max_rows"]
+            and len(stale) > st["prune_max_fraction"] * len(rows)):
+        raise PruneRefused(f"{label}: v Traktu chybí {len(stale)} z {len(rows)} záznamů — "
+                           "neprořezávám (výpadek Traktu?). Pokud je to záměr: "
+                           "track.py sync --allow-mass-delete")
+    if soft:
+        now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        con.executemany(f"UPDATE {table} SET deleted_at=? WHERE {column}=?",
+                        [(now, i) for i in stale])
+        print(f"  označeno {len(stale)} záznamů, které v Traktu už nejsou ({label})")
+    else:
         con.executemany(f"DELETE FROM {table} WHERE {column}=?", [(i,) for i in stale])
         print(f"  smazáno {len(stale)} záznamů, které v Traktu už nejsou ({label})")
+    return len(stale)
 
 
-def cmd_sync(_args: argparse.Namespace) -> None:
+def cmd_sync(args: argparse.Namespace) -> None:
     con = db()
-    cfg = load_config()
+    allow_mass = bool(getattr(args, "allow_mass_delete", False))
+    refused: list[str] = []
+
+    def prune(*a, **kw) -> None:
+        try:
+            _prune(con, *a, allow_mass=allow_mass, **kw)
+        except PruneRefused as e:
+            refused.append(str(e))
 
     me = _req("GET", "/users/me")[0]
     user = me.get("username")
@@ -293,12 +345,12 @@ def cmd_sync(_args: argparse.Namespace) -> None:
     for it in movies:
         m = it.get("movie") or {}
         con.execute(
-            "INSERT OR REPLACE INTO watched_movies VALUES(?,?,?,?,?,?,?,?,?)",
+            f"INSERT OR REPLACE INTO watched_movies({MOVIE_COLS}) VALUES(?,?,?,?,?,?,?,?,?)",
             (it.get("id"), m.get("ids", {}).get("trakt"), m.get("title"), m.get("year"),
              it.get("watched_at"), it.get("action"),
              m.get("ids", {}).get("imdb"), m.get("ids", {}).get("tmdb"), m.get("runtime")))
     print(f"  {len(movies)} záznamů")
-    _prune(con, "watched_movies", "history_id", {it.get("id") for it in movies}, "filmů")
+    prune("watched_movies", "history_id", {it.get("id") for it in movies}, "filmů", soft=True)
 
     print("Historie epizod…")
     eps = paged("/sync/history/episodes", {"extended": "full"})
@@ -306,12 +358,12 @@ def cmd_sync(_args: argparse.Namespace) -> None:
         ep = it.get("episode") or {}
         show = it.get("show") or {}
         con.execute(
-            "INSERT OR REPLACE INTO watched_episodes VALUES(?,?,?,?,?,?,?,?,?)",
+            f"INSERT OR REPLACE INTO watched_episodes({EPISODE_COLS}) VALUES(?,?,?,?,?,?,?,?,?)",
             (it.get("id"), show.get("ids", {}).get("trakt"), show.get("title"),
              ep.get("season"), ep.get("number"), ep.get("title"), it.get("watched_at"),
              it.get("action"), ep.get("runtime")))
     print(f"  {len(eps)} záznamů")
-    _prune(con, "watched_episodes", "history_id", {it.get("id") for it in eps}, "epizod")
+    prune("watched_episodes", "history_id", {it.get("id") for it in eps}, "epizod", soft=True)
 
     print("Hodnocení…")
     total = 0
@@ -400,8 +452,9 @@ def cmd_sync(_args: argparse.Namespace) -> None:
         if i % 25 == 0:
             print(f"  … {i}/{len(shows)}")
     print(f"  {len(shows)} seriálů")
-    _prune(con, "shows_progress", "trakt_id",
-           {(it.get("show") or {}).get("ids", {}).get("trakt") for it in shows}, "seriálů")
+    prune("shows_progress", "trakt_id",
+          {(it.get("show") or {}).get("ids", {}).get("trakt") for it in shows}, "seriálů",
+          soft=False)
 
     stats = _req("GET", "/users/me/stats")[0]
     set_meta(con, "stats", json.dumps(stats))
@@ -409,6 +462,10 @@ def cmd_sync(_args: argparse.Namespace) -> None:
     set_meta(con, "synced_at", dt.datetime.now().astimezone().isoformat(timespec="seconds"))
     con.commit()
     con.close()
+    if refused:
+        for r in refused:
+            print(f"! {r}", file=sys.stderr)
+        sys.exit(common.EXIT_GUARD)
     print("Synchronizováno.")
 
 
@@ -424,13 +481,12 @@ def parse_when(iso: str | None) -> dt.datetime | None:
         return None
 
 
-def cn(n: int, one: str, few: str, many: str) -> str:
-    """České počítání: 1 film, 2–4 filmy, 5+ filmů."""
-    if n == 1:
-        return f"{n} {one}"
-    if 2 <= n <= 4:
-        return f"{n} {few}"
-    return f"{n} {many}"
+def dated(iso: str | None) -> dt.datetime | None:
+    """Místní čas záznamu; None u „neznámého“ data (Trakt ho vede k 1. 1. 1970)."""
+    return parse_when(iso) if (iso or "") >= "2000" else None
+
+
+cn = common.cn
 
 
 def cmd_report(args: argparse.Namespace) -> None:
@@ -454,12 +510,12 @@ def cmd_report(args: argparse.Namespace) -> None:
         end = dt.datetime(y + (m == 12), (m % 12) + 1, 1, tzinfo=today.tzinfo)
         label = f"{ym}"
 
-    lo, hi = start.isoformat(), end.isoformat()
+    lo, hi = common.utc_bound(start), common.utc_bound(end)
     movies = con.execute(
-        "SELECT title, year, watched_at FROM watched_movies WHERE watched_at>=? AND watched_at<? "
+        "SELECT title, year, watched_at FROM live_movies WHERE watched_at>=? AND watched_at<? "
         "ORDER BY watched_at", (lo, hi)).fetchall()
     eps = con.execute(
-        "SELECT show_title, season, episode, ep_title, watched_at, runtime FROM watched_episodes "
+        "SELECT show_title, season, episode, ep_title, watched_at, runtime FROM live_episodes "
         "WHERE watched_at>=? AND watched_at<? ORDER BY watched_at", (lo, hi)).fetchall()
     rts = con.execute(
         "SELECT kind, title, season, episode, rating FROM ratings WHERE rated_at>=? AND rated_at<? "
@@ -468,7 +524,7 @@ def cmd_report(args: argparse.Namespace) -> None:
     minutes = sum((e[5] or 0) for e in eps)
     movies_min = 0
     if movies:
-        mm = con.execute("SELECT SUM(runtime) FROM watched_movies WHERE watched_at>=? AND watched_at<?",
+        mm = con.execute("SELECT SUM(runtime) FROM live_movies WHERE watched_at>=? AND watched_at<?",
                          (lo, hi)).fetchone()[0]
         movies_min = mm or 0
     minutes += movies_min
@@ -574,24 +630,23 @@ def cmd_report_all(_args: argparse.Namespace) -> None:
         "SELECT COUNT(*), COUNT(DISTINCT title || '|' || COALESCE(year, 0)), "
         "MIN(watched_at) FILTER (WHERE watched_at >= '2000-01-01'), "
         "MAX(watched_at) FILTER (WHERE watched_at >= '2000-01-01'), "
-        "SUM(runtime) FROM watched_movies").fetchone()
+        "SUM(runtime) FROM live_movies").fetchone()
     ep = con.execute(
         "SELECT COUNT(*), COUNT(DISTINCT show_title || '|' || season || '|' || episode), "
         "MIN(watched_at) FILTER (WHERE watched_at >= '2000-01-01'), "
         "MAX(watched_at) FILTER (WHERE watched_at >= '2000-01-01'), "
-        "SUM(runtime) FROM watched_episodes").fetchone()
+        "SUM(runtime) FROM live_episodes").fetchone()
     minutes = int(mv[4] or 0) + int(ep[4] or 0)
 
     dated = con.execute(
-        "SELECT COUNT(*) FROM watched_movies WHERE watched_at >= '2000-01-01'").fetchone()[0]
+        "SELECT COUNT(*) FROM live_movies WHERE watched_at >= '2000-01-01'").fetchone()[0]
     dated += con.execute(
-        "SELECT COUNT(*) FROM watched_episodes WHERE watched_at >= '2000-01-01'").fetchone()[0]
+        "SELECT COUNT(*) FROM live_episodes WHERE watched_at >= '2000-01-01'").fetchone()[0]
     undated = (mv[0] + ep[0]) - dated
-    days = con.execute(
-        "SELECT COUNT(*) FROM (SELECT DISTINCT substr(watched_at, 1, 10) d FROM ("
-        "  SELECT watched_at FROM watched_movies WHERE watched_at >= '2000-01-01'"
-        "  UNION ALL SELECT watched_at FROM watched_episodes WHERE watched_at >= '2000-01-01'))"
-    ).fetchone()[0]
+    rows = [("m", w, rt) for w, rt in con.execute("SELECT watched_at, runtime FROM live_movies")]
+    rows += [("e", w, rt) for w, rt in con.execute("SELECT watched_at, runtime FROM live_episodes")]
+    # dny a roky podle místního času, stejně jako měsíční přehled
+    days = len({p.date() for _k, w, _rt in rows if (p := dated(w))})
 
     print(f"## Celoživotní přehled — účet {who}")
     print()
@@ -613,22 +668,13 @@ def cmd_report_all(_args: argparse.Namespace) -> None:
 
     print("### Podle let")
     years: dict[str, list[int]] = {}
-    for y, m, e, mm, me in con.execute("""
-            SELECT y, SUM(f), SUM(e), SUM(fm), SUM(em) FROM (
-              SELECT substr(watched_at, 1, 4) y, COUNT(*) f, 0 e,
-                     COALESCE(SUM(runtime), 0) fm, 0 em FROM watched_movies GROUP BY 1
-              UNION ALL
-              SELECT substr(watched_at, 1, 4), 0, COUNT(*), 0, COALESCE(SUM(runtime), 0)
-                FROM watched_episodes GROUP BY 1
-            ) GROUP BY y ORDER BY y"""):
-        years[y] = [m, e, int(mm or 0) + int(me or 0)]
     undated_years = [0, 0, 0]
-    real_years: list[tuple] = []
-    for y, (m, e, mins) in years.items():
-        if not y or y < "2000":
-            undated_years = [undated_years[0] + m, undated_years[1] + e, undated_years[2] + mins]
-        else:
-            real_years.append((y, m, e, mins))
+    for kind, w, rt in rows:
+        p = dated(w)
+        acc = years.setdefault(str(p.year), [0, 0, 0]) if p else undated_years
+        acc[0 if kind == "m" else 1] += 1
+        acc[2] += int(rt or 0)
+    real_years = [(y, *v) for y, v in years.items()]
     if undated_years[0] or undated_years[1]:
         print(f"- **bez data**: {undated_years[0]} filmů, {undated_years[1]} epizod, "
               f"cca {undated_years[2] // 60} h")
@@ -638,13 +684,13 @@ def cmd_report_all(_args: argparse.Namespace) -> None:
 
     print("### Nejvíc zhlédnuté seriály")
     for t, n in con.execute(
-            "SELECT show_title, COUNT(DISTINCT season || '|' || episode) FROM watched_episodes "
+            "SELECT show_title, COUNT(DISTINCT season || '|' || episode) FROM live_episodes "
             "GROUP BY show_title ORDER BY 2 DESC LIMIT 10"):
         print(f"- **{t}** — {cn(n, 'díl', 'díly', 'dílů')}")
     print()
 
     print("### Filmy víckrát")
-    for t, n in con.execute("SELECT title, COUNT(*) FROM watched_movies GROUP BY title "
+    for t, n in con.execute("SELECT title, COUNT(*) FROM live_movies GROUP BY title "
                             "HAVING COUNT(*) > 1 ORDER BY 2 DESC LIMIT 8"):
         print(f"- **{t}** — {n}×")
     print()
@@ -664,11 +710,15 @@ def cmd_report_all(_args: argparse.Namespace) -> None:
 
 def cmd_status(_args: argparse.Namespace) -> None:
     con = db()
-    for table, label in (("watched_movies", "filmy"), ("watched_episodes", "epizody"),
+    for table, label in (("live_movies", "filmy"), ("live_episodes", "epizody"),
                          ("ratings", "hodnocení"), ("watchlist", "watchlist"),
                          ("shows_progress", "seriály")):
         n = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         print(f"{label:12s} {n}")
+    gone = sum(con.execute(f"SELECT COUNT(*) FROM {t} WHERE deleted_at IS NOT NULL").fetchone()[0]
+               for t in ("watched_movies", "watched_episodes"))
+    if gone:
+        print(f"{'z Traktu smazané (archiv)':12s} {gone}")
     row = con.execute("SELECT value FROM meta WHERE key='synced_at'").fetchone()
     print(f"naposledy sync: {row[0] if row else 'nikdy'}")
     con.close()
@@ -684,8 +734,8 @@ def cmd_watchtime(args: argparse.Namespace) -> None:
     a `--hours-per-day`. Z dat se vzít nedá, pre-Trakt roky v žádném zdroji nejsou.
     """
     con = db()
-    mv = list(con.execute("SELECT title, watched_at, runtime FROM watched_movies"))
-    ep = list(con.execute("SELECT show_title, watched_at, runtime FROM watched_episodes"))
+    mv = list(con.execute("SELECT title, watched_at, runtime FROM live_movies"))
+    ep = list(con.execute("SELECT show_title, watched_at, runtime FROM live_episodes"))
     tot_m = sum(r[2] or 0 for r in mv)
     tot_e = sum(r[2] or 0 for r in ep)
     tot = tot_m + tot_e
@@ -706,7 +756,8 @@ def cmd_watchtime(args: argparse.Namespace) -> None:
 
     years: dict[str, int] = {}
     for _t, w, rt in mv + ep:
-        y = w[:4] if (w or "") >= "2000" else "bez data"
+        p = dated(w)
+        y = str(p.year) if p else "bez data"
         years[y] = years.get(y, 0) + (rt or 0)
     print("### Podle let")
     for y in sorted(years, key=lambda y: (y == "bez data", y)):
@@ -759,7 +810,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Trakt tracker")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("auth", help="přihlášení přes device flow").set_defaults(func=cmd_auth)
-    sub.add_parser("sync", help="stáhne data z Traktu do tracker.db").set_defaults(func=cmd_sync)
+    sy = sub.add_parser("sync", help="stáhne data z Traktu do tracker.db")
+    sy.add_argument("--allow-mass-delete", action="store_true",
+                    help="dovolit označit jako smazané i velkou část historie")
+    sy.set_defaults(func=cmd_sync)
     rp = sub.add_parser("report", help="vygeneruje přehled")
     rp.add_argument("--month", help="YYYY-MM (výchozí: tento měsíc)")
     rp.add_argument("--year", action="store_true", help="celý letošní rok")
