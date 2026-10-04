@@ -13,22 +13,28 @@ Použití:
     python3 backup_db.py --list     # co je v záloze
     python3 backup_db.py --to DIR   # jiná cílová složka
 
-Cíl se dá nastavit i proměnnou TRAKT_BACKUP_DIR (kvůli cronu).
+Cíl se dá nastavit i proměnnou TRAKT_BACKUP_DIR (kvůli cronu) nebo klíčem
+"backup_dir" v bloku "settings" v config.json.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
-import json
 import os
 import pathlib
+import re
 import shutil
 import sqlite3
 import sys
 
-HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+import common  # noqa: E402
+
+HERE = common.DATA_DIR
 DB = HERE / "tracker.db"
+TABLES = ("watched_movies", "watched_episodes", "shows_progress")
 ICLOUD = (pathlib.Path.home() / "Library/Mobile Documents/com~apple~CloudDocs"
           / "trakt-tracker-backups")
 COPY_ALSO = ["alias.json"]          # co je malé a nenahraditelné
@@ -39,7 +45,7 @@ KEEP_MONTHS = 12                    # + poslední snapshot z každého měsíce
 def target_dir(arg: str | None) -> pathlib.Path:
     if arg:
         return pathlib.Path(arg).expanduser()
-    env = os.environ.get("TRAKT_BACKUP_DIR")
+    env = os.environ.get("TRAKT_BACKUP_DIR") or common.settings().get("backup_dir")
     if env:
         return pathlib.Path(env).expanduser()
     return ICLOUD
@@ -62,49 +68,67 @@ def make_snapshot(dst: pathlib.Path) -> pathlib.Path:
     tmp.unlink(missing_ok=True)
     src = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
     try:
+        before = _counts(src)
         src.execute("VACUUM INTO ?", (str(tmp),))
+        after = _counts(src)
     finally:
         src.close()
-    tmp.replace(out)
 
-    # kontrola: kopie se musí dát otevřít a mít stejně záznamů jako originál
-    with sqlite3.connect(DB) as a, sqlite3.connect(out) as b:
-        check = b.execute("PRAGMA integrity_check").fetchone()[0]
-        if check != "ok":
-            out.unlink(missing_ok=True)
-            sys.exit(f"Snímek neprošel kontrolou integrity ({check}) — zahozen.")
-        for table in ("watched_movies", "watched_episodes", "shows_progress"):
-            n_src = a.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            n_dst = b.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            if n_src != n_dst:
-                out.unlink(missing_ok=True)
-                sys.exit(f"Snímek nesedí ({table}: {n_src} vs {n_dst}) — zahozen.")
+    # kontrola: kopie se musí dát otevřít a mít stejně záznamů jako originál.
+    # Souběžný `sync` může mezitím commitnout, proto stačí shoda se stavem těsně
+    # před nebo těsně po snímku.
+    con = sqlite3.connect(tmp)
+    try:
+        check = con.execute("PRAGMA integrity_check").fetchone()[0]
+        got = _counts(con)
+    finally:
+        con.close()
+    if check != "ok":
+        tmp.unlink(missing_ok=True)
+        sys.exit(f"Snímek neprošel kontrolou integrity ({check}) — zahozen.")
+    if got not in (before, after):
+        tmp.unlink(missing_ok=True)
+        sys.exit(f"Snímek nesedí ({got} vs {before}/{after}) — zahozen.")
+    os.chmod(tmp, 0o600)
+    tmp.replace(out)
 
     for name in COPY_ALSO:
         src_file = HERE / name
         if src_file.exists():
             shutil.copy2(src_file, dst / name)
 
-    meta = {"db_records": None, "created": dt.datetime.now().isoformat(timespec="seconds")}
-    with sqlite3.connect(out) as con:
-        meta["db_records"] = sum(
-            con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-            for t in ("watched_movies", "watched_episodes"))
-    (dst / "last_backup.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1))
+    meta = {"db_records": got[0] + got[1],
+            "created": dt.datetime.now().isoformat(timespec="seconds")}
+    common.atomic_write_json(dst / "last_backup.json", meta)
     return out
 
 
-def prune(dst: pathlib.Path) -> list[pathlib.Path]:
-    """Nechá všechny snapshots za posledních 30 dní + nejnovější z každého měsíce."""
-    snaps = snapshots(dst)
+def _counts(con: sqlite3.Connection) -> tuple:
+    return tuple(con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in TABLES)
+
+
+def snapshot_date(path: pathlib.Path) -> dt.date:
+    """Datum z názvu `tracker-YYYY-MM-DD[...]`; mtime jen jako záloha — iCloud ho
+    při stažení nebo obnově umí změnit."""
+    m = re.match(r"tracker-(\d{4}-\d{2}-\d{2})", path.name)
+    if m:
+        try:
+            return dt.date.fromisoformat(m.group(1))
+        except ValueError:
+            pass
+    return dt.date.fromtimestamp(path.stat().st_mtime)
+
+
+def prune(dst: pathlib.Path, today: dt.date | None = None) -> list[pathlib.Path]:
+    """Nechá všechny snapshots za posledních 30 dní + nejnovější z posledních 12 měsíců."""
+    snaps = sorted(snapshots(dst), key=lambda s: (snapshot_date(s), s.name))
     if not snaps:
         return []
-    cut = dt.date.today() - dt.timedelta(days=KEEP_DAYS)
-    keep = {s for s in snaps if dt.date.fromtimestamp(s.stat().st_mtime) >= cut}
+    cut = (today or dt.date.today()) - dt.timedelta(days=KEEP_DAYS)
+    keep = {s for s in snaps if snapshot_date(s) >= cut}
     monthly: dict[str, pathlib.Path] = {}
     for s in snaps:
-        key = dt.date.fromtimestamp(s.stat().st_mtime).strftime("%Y-%m")
-        monthly[key] = s          # snaps jsou seřazené, takže vyjde nejnovější z měsíce
+        monthly[snapshot_date(s).strftime("%Y-%m")] = s   # seřazené → nejnovější z měsíce
     keep |= set(list(monthly.values())[-KEEP_MONTHS:])
     if snaps:
         keep.add(snaps[-1])

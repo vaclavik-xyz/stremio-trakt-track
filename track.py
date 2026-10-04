@@ -9,17 +9,16 @@ Použití:
   python3 track.py status          # co je v DB a kdy se naposledy synchronizovalo
 
 Konfigurace: config.json v této složce (client_id + client_secret, práva 600).
-Token se ukládá do stejného souboru a automaticky se obnovuje.
+Token se ukládá do stejného souboru a automaticky se obnovuje. Volitelný blok
+"settings" přepisuje výchozí hodnoty z common.DEFAULTS.
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
 import json
-import os
 import pathlib
 import sqlite3
-import stat
 import sys
 import time
 import urllib.error
@@ -37,13 +36,6 @@ UA = "stremio-trakt-track/2.0"
 # ---------------------------------------------------------------- konfigurace
 
 
-def _harden(path: pathlib.Path) -> None:
-    try:
-        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
-
-
 def load_config() -> dict:
     if not CONFIG.exists():
         sys.exit(f"Chybí {CONFIG}. Spusť nejdřív setup_secret.sh.")
@@ -51,8 +43,8 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    CONFIG.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
-    _harden(CONFIG)
+    # atomicky a rovnou 600: pád uprostřed zápisu nesmí smazat token
+    common.atomic_write_json(CONFIG, cfg, indent=2)
 
 
 # --------------------------------------------------------------------- HTTP
@@ -178,9 +170,9 @@ def cmd_auth(_args: argparse.Namespace) -> None:
     print("Čekám na potvrzení…", flush=True)
 
     device_code = payload["device_code"]
-    (HERE / ".device.json").write_text(json.dumps(
-        {"user_code": code, "verification_url": url,
-         "expires_at": int(time.time()) + expires}, indent=2), encoding="utf-8")
+    common.atomic_write_json(HERE / ".device.json",
+                             {"user_code": code, "verification_url": url,
+                              "expires_at": int(time.time()) + expires}, indent=2)
     deadline = time.time() + expires
     while time.time() < deadline:
         time.sleep(interval)
@@ -616,7 +608,7 @@ def cmd_report(args: argparse.Namespace) -> None:
 def cmd_report_all(_args: argparse.Namespace) -> None:
     """Celoživotní přehled z tracker.db.
 
-    Trakt `/users/me/stats` vrací u tohohle účtu null, takže se všechno počítá
+    Trakt `/users/me/stats` umí vrátit null, takže se všechno počítá
     z historie: počty záznamů, unikátní tituly, hodiny (z runtime jednotlivých
     záznamů), dny a roky.
     """
