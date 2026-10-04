@@ -14,7 +14,7 @@ if [ -f "$CFG" ]; then
 fi
 
 read -r -p "Client ID:  " CID
-read -r -s -p "Client Secret (Enter = přeskočit):  " CSEC
+read -r -s -p "Client Secret (Enter = ponechat uložený / přeskočit):  " CSEC
 echo
 read -r -p "Redirect URI (Enter = urn:ietf:wg:oauth:2.0:oob):  " RURI
 
@@ -34,6 +34,10 @@ if path.exists():
 data = {"client_id": cid, "redirect_uri": ruri or "urn:ietf:wg:oauth:2.0:oob"}
 if csec:
     data["client_secret"] = csec
+elif old.get("client_secret"):
+    # Enter u secretu nesmí smazat uložený — bez něj se token sám neobnoví
+    data["client_secret"] = old["client_secret"]
+    print("Client Secret ponechán z dřívějška.")
 if old.get("settings"):
     data["settings"] = old["settings"]      # vlastní nastavení přepsání přežije
 common.atomic_write_json(path, data, indent=2)

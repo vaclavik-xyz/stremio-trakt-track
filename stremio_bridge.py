@@ -951,7 +951,13 @@ def cmd_exact(args: argparse.Namespace) -> int:
     if item is None:
         sys.exit(f"V knihovně Stremia není {args.only}.")
     stremio_id = item.get("_id")
-    st = stremio_state(item)
+    try:
+        st = stremio_state(item)
+    except ITEM_ERRORS as e:
+        # stejně jako compute_gaps: chyba dat/Cinemety = čistá hláška, nic se nemění
+        print(f"{item.get('name')}: stav ze Stremia nejde přečíst ({type(e).__name__}: {e}) "
+              "— nic neměním, zkus to později.", file=sys.stderr)
+        sys.exit(common.EXIT_ERROR)
     trakt_id = alias.get(stremio_id, stremio_id)
     if st.get("error") or not st.get("verified"):
         sys.exit(f"{st['name']}: mapování není ověřené ({st.get('error') or st.get('reason')}), "
@@ -1059,7 +1065,12 @@ def _sig_keys(kind: str, ids: dict, season, episode, watched_at) -> set[tuple]:
             for k in ("trakt", "imdb") if ids.get(k)}
 
 
-def restore_candidates_from_journal(path: pathlib.Path) -> list[dict]:
+def _since_ok(entry: dict, since: str | None) -> bool:
+    """`--since` u všech zdrojů filtruje podle původního `watched_at`."""
+    return not since or str(entry.get("watched_at") or "") >= since
+
+
+def restore_candidates_from_journal(path: pathlib.Path, since: str | None = None) -> list[dict]:
     """Smazané záznamy z deníku `exact` (removed) nebo `redate` (remove_entries
     u řádků, kde se opravdu smazaly)."""
     data = common.read_json(path, None)
@@ -1069,12 +1080,12 @@ def restore_candidates_from_journal(path: pathlib.Path) -> list[dict]:
     for row in data.get("shows") or []:
         gone = set(row.get("removed") or [])
         out += [e for e in row.get("remove_entries") or [] if e.get("history_id") in gone]
-    return out
+    return [e for e in out if _since_ok(e, since)]
 
 
 def restore_candidates_from_log(since: str | None) -> list[dict]:
     return [r for r in writes.log_records()
-            if r.get("op") == "remove" and (not since or str(r.get("ts", "")) >= since)]
+            if r.get("op") == "remove" and _since_ok(r, since)]
 
 
 def restore_candidates_from_db(path: pathlib.Path, since: str | None) -> list[dict]:
@@ -1097,7 +1108,7 @@ def restore_candidates_from_db(path: pathlib.Path, since: str | None) -> list[di
         con.close()
     for c in out:
         c["ids"] = {k: v for k, v in c["ids"].items() if v}
-    return [c for c in out if not since or str(c.get("watched_at") or "") >= since]
+    return [c for c in out if _since_ok(c, since)]
 
 
 def current_history_signatures() -> set[tuple]:
@@ -1121,7 +1132,8 @@ def cmd_restore(args: argparse.Namespace) -> int:
     (stejný titul, díl a čas), se přeskočí — opakované spuštění nic nezdvojí.
     """
     if args.from_journal:
-        cands = restore_candidates_from_journal(pathlib.Path(args.from_journal).expanduser())
+        cands = restore_candidates_from_journal(pathlib.Path(args.from_journal).expanduser(),
+                                                args.since)
     elif args.from_db:
         cands = restore_candidates_from_db(pathlib.Path(args.from_db).expanduser(), args.since)
     else:
@@ -1227,7 +1239,7 @@ def main() -> None:
     src.add_argument("--from-journal", help="deník exact/redate (např. last_exact.json)")
     src.add_argument("--from-log", action="store_true", help="odebrání z write_log.jsonl (výchozí)")
     src.add_argument("--from-db", help="snapshot tracker.db ze zálohy")
-    rs.add_argument("--since", help="jen záznamy od tohoto data (ISO)")
+    rs.add_argument("--since", help="jen záznamy zhlédnuté od tohoto data (ISO, podle watched_at)")
     rs.add_argument("--only", help="jen titul (ID nebo část názvu)")
     rs.add_argument("--yes", action="store_true", help="skutečně zapsat")
     rs.add_argument("--force-repeat", action="store_true",

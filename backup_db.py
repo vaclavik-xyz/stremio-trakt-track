@@ -93,13 +93,17 @@ def make_snapshot(dst: pathlib.Path) -> pathlib.Path:
     tmp = out.with_suffix(".tmp")
     tmp.unlink(missing_ok=True)
     src = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    # osobní data: soubor vznikne rovnou s 0600 (umask 077), ne s právy podle
+    # umasku uživatele a chmod až po kontrole — ani na chvíli čitelný pro ostatní
+    old_umask = os.umask(0o077)
     try:
         before = _counts(src)
         src.execute("VACUUM INTO ?", (str(tmp),))
         after = _counts(src)
     finally:
+        os.umask(old_umask)
         src.close()
-    os.chmod(tmp, 0o600)            # osobní data: hned, ne až po kontrole
+    os.chmod(tmp, 0o600)
 
     # kontrola: kopie se musí dát otevřít a mít stejně záznamů jako originál.
     # Souběžný `sync` může mezitím commitnout, proto stačí shoda se stavem těsně

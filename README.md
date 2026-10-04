@@ -245,8 +245,10 @@ Optional `"settings"` block in `config.json` (defaults shown):
 - Shows whose bitfield cannot be verified are handled by `forward`, which fills the
   gap up to the last watched episode (including episodes you may have skipped).
 - Rewatches are not detected; a title already on Trakt is not written again.
-- Trakt access tokens expire after about a week; with a client secret the tool
-  refreshes them automatically, otherwise run `track.py auth` again.
+- Trakt access tokens are valid for about a week (the lifetime comes from Trakt's
+  `expires_in`; 90 days is only a fallback when the API does not send it). With a
+  `client_secret` in `config.json` the tool refreshes the token a day before it
+  expires; without it, run `python3 track.py auth` again when it runs out.
 
 ## Tests
 
