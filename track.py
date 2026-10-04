@@ -26,11 +26,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import common
+
 BASE = "https://api.trakt.tv"
-HERE = pathlib.Path(__file__).resolve().parent
+HERE = common.DATA_DIR
 CONFIG = HERE / "config.json"
 DB = HERE / "tracker.db"
-UA = "stremio-trakt-track/1.0.0"
+UA = "stremio-trakt-track/2.0"
 
 # ---------------------------------------------------------------- konfigurace
 
@@ -100,6 +102,11 @@ def _req(method: str, path: str, params: dict | None = None,
             raise TraktError(f"{method} {path} -> HTTP {e.code}: {detail}") from None
         except urllib.error.URLError as e:
             raise TraktError(f"Síťová chyba u {path}: {e.reason}") from None
+        except (TimeoutError, OSError) as e:
+            # timeout while reading the body is not wrapped in URLError
+            raise TraktError(f"Síťová chyba u {path}: {e}") from None
+        except ValueError as e:
+            raise TraktError(f"{method} {path}: neplatná odpověď ({e})") from None
     raise TraktError(f"{method} {path}: rate limit se nevyřešil")
 
 

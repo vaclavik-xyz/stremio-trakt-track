@@ -101,12 +101,13 @@ def main() -> None:
     new_movies = push.get("movies") or []
     over_max = fwd.get("over_max") or []
     denied = (push.get("denied") or []) + (fwd.get("denied") or [])
+    repeat = (push.get("repeat") or []) + (fwd.get("repeat") or [])
 
     by_show: dict[str, list] = {}
     for row in (push.get("shows") or []) + (fwd.get("written") or []):
         by_show.setdefault(row["name"], []).extend(row["pairs"])
 
-    if not (new_movies or by_show or over_max or denied or problems):
+    if not (new_movies or by_show or over_max or denied or repeat or problems):
         return
 
     today = dt.datetime.now().astimezone().strftime("%-d. %-m.")
@@ -139,6 +140,13 @@ def main() -> None:
         print("⚠ **Trakt něco nepřijal:**")
         for d in denied:
             print(f"- {d}")
+
+    if repeat:
+        print()
+        print("⚠ **Opakovaný zápis zastaven** — Trakt položku přijal, ale pořád ji nevidí "
+              "(skrytá řada, sloučené ID?). Nezapsáno, prověř ručně:")
+        for r in repeat:
+            print(f"- {r.get('name') or '?'} ({r.get('key')})")
 
     if problems:
         print()

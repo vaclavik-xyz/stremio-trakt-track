@@ -3,7 +3,7 @@
 
 Stremio si svou knihovnu a stav zhlédnutí drží ve vlastním cloudu (to je jeho
 základní funkce a nepadá). Trakt propojení ve Stremiu ale odpadá po hodinách.
-Tenuhle most čte stav ze Stremia a doplňuje, co v Traktu chybí.
+Tenhle most čte stav ze Stremia a doplňuje, co v Traktu chybí.
 
 Použití:
   python3 stremio_bridge.py list        # co je ve stremio knihovně
@@ -13,6 +13,11 @@ Použití:
 
 Přihlášení (jednorázově): bash setup_stremio.sh
 Ukládá se jen authKey do stremio.json (práva 600), heslo se nikam neukládá.
+
+Zásada: o zápisu se rozhoduje jen z úplných dat. Když se čtení z Traktu nebo
+Stremia nepovede, příkaz skončí chybou — nikdy nepokračuje s prázdnou množinou,
+protože „Trakt nemá nic“ by znamenalo zapsat všechno znovu (Trakt duplicity
+nevyřazuje, každý zápis je další zhlédnutí).
 """
 from __future__ import annotations
 
@@ -20,27 +25,37 @@ import argparse
 import base64
 import difflib
 import json
-import os
 import pathlib
 import re
-import sqlite3
-import stat
 import sys
 import time
 import urllib.error
 import urllib.request
 import zlib
 
-HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+CODE_DIR = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(CODE_DIR))
 
+import common  # noqa: E402
+import writes  # noqa: E402
+
+HERE = common.DATA_DIR
 STREMIO_CFG = HERE / "stremio.json"
 RAW = HERE / "stremio_library.json"
 PUSHED = HERE / "pushed.json"
+GAPS = HERE / "gaps.json"
 CINEMETA_CACHE = HERE / "cinemeta_cache.json"
+TRAKT_EPISODES_CACHE = HERE / "trakt_episodes_cache.json"
+LAST_PUSH = HERE / "last_push.json"
+LAST_FORWARD = HERE / "last_forward.json"
+LAST_EXACT = HERE / "last_exact.json"
 SAPI = "https://api.strem.io/api"
 CINEMETA = "https://v3-cinemeta.strem.io/meta/series/{}.json"
-UA = "stremio-trakt-track/1.0.0"
+UA = "stremio-trakt-bridge/2.0"
+
+
+class BridgeError(RuntimeError):
+    """Data from Stremio/Cinemeta could not be read or does not make sense."""
 
 
 # ------------------------------------------------------------------ pomocné
@@ -53,8 +68,7 @@ def load_stremio() -> dict:
 
 
 def save_stremio(cfg: dict) -> None:
-    STREMIO_CFG.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
-    os.chmod(STREMIO_CFG, stat.S_IRUSR | stat.S_IWUSR)
+    common.atomic_write_json(STREMIO_CFG, cfg, indent=2)
 
 
 def s_call(path: str, payload: dict) -> object:
@@ -68,6 +82,8 @@ def s_call(path: str, payload: dict) -> object:
         sys.exit(f"Stremio API HTTP {e.code}: {e.read()[:200].decode(errors='replace')}")
     except urllib.error.URLError as e:
         sys.exit(f"Síťová chyba u Stremia: {e.reason}")
+    except (TimeoutError, OSError, ValueError) as e:
+        sys.exit(f"Stremio API: {e}")
     if isinstance(data, dict) and data.get("error"):
         sys.exit(f"Stremio API: {data['error'].get('message')}")
     return data.get("result") if isinstance(data, dict) else data
@@ -87,6 +103,10 @@ def cmd__login(args: argparse.Namespace) -> None:
     print(f"Přihlášeno jako {user.get('email') or args.email}. Klíč uložen do stremio.json (600).")
 
 
+def _ttl() -> float:
+    return float(common.settings()["cache_ttl_hours"])
+
+
 # ------------------------------------------------------------- stremio data
 
 
@@ -95,8 +115,10 @@ def fetch_raw(force: bool = False, max_age: int = 300) -> list:
         return json.loads(RAW.read_text())
     cfg = load_stremio()
     items = s_call("/datastoreGet",
-                   {"authKey": cfg["authKey"], "collection": "libraryItem", "all": True}) or []
-    RAW.write_text(json.dumps(items, indent=1, ensure_ascii=False))
+                   {"authKey": cfg["authKey"], "collection": "libraryItem", "all": True})
+    if not isinstance(items, list):
+        sys.exit("Stremio nevrátilo seznam knihovny.")
+    common.atomic_write_json(RAW, items)
     return items
 
 
@@ -116,19 +138,28 @@ def decode_watched(text: str):
     return sid, int(season), int(ep), n, idx
 
 
-def cinemeta_videos(imdb: str) -> list[tuple[int, int, str]]:
-    cache = json.loads(CINEMETA_CACHE.read_text()) if CINEMETA_CACHE.exists() else {}
-    if imdb in cache:
-        return [tuple(x) for x in cache[imdb]]
+def cinemeta_videos(stremio_id: str, refresh: bool = False) -> list[list]:
+    """Videa seriálu v pořadí Cinemety: [[video_id, season, episode, title], …].
+
+    Chyba nebo prázdná odpověď vyhodí BridgeError — prázdný seznam by vypadal jako
+    seriál bez dílů."""
+    cache = common.JsonCache(CINEMETA_CACHE, _ttl())
+    if not refresh:
+        hit = cache.get(stremio_id)
+        if hit:
+            return [list(x) for x in hit]
     try:
-        with urllib.request.urlopen(CINEMETA.format(imdb), timeout=25) as r:
+        req = urllib.request.Request(CINEMETA.format(stremio_id), headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=25) as r:
             meta = (json.loads(r.read()) or {}).get("meta") or {}
-    except Exception as e:
-        print(f"  ! metadata pro {imdb} se nepovedla: {e}", file=sys.stderr)
-        return []
-    videos = [(v.get("season"), v.get("number"), v.get("name") or "") for v in (meta.get("videos") or [])]
-    cache[imdb] = videos
-    CINEMETA_CACHE.write_text(json.dumps(cache, ensure_ascii=False))
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+        raise BridgeError(f"metadata z Cinemety pro {stremio_id} se nepovedla: {e}") from None
+    videos = [[v.get("id") or "", v.get("season"), v.get("episode", v.get("number")),
+               v.get("name") or v.get("title") or ""]
+              for v in (meta.get("videos") or [])]
+    if not videos:
+        raise BridgeError(f"Cinemeta u {stremio_id} nevrátila žádná videa")
+    cache.put(stremio_id, videos)
     return videos
 
 
@@ -147,15 +178,17 @@ def stremio_state(item: dict) -> dict:
             videos = cinemeta_videos(sid or item.get("_id"))
             if len(videos) >= n and n:
                 for i in idx:
-                    s, e, _t = videos[i]
+                    _vid, s, e, _t = videos[i]
                     if s is not None and e is not None:
                         out["watched"].add((int(s), int(e)))
                 # Stremio sám říká, který díl byl poslední → musí sedět na nejvyšší index
                 if idx:
-                    s, e, _t = videos[max(idx)]
+                    _vid, s, e, _t = videos[max(idx)]
                     out["marker"] = (ls, le)
-                    out["marker_mapped"] = (int(s), int(e))
-                    if (int(s), int(e)) != (ls, le) and (ls, le) != (0, 0):
+                    if s is None or e is None:
+                        out["verified"] = False
+                        out["reason"] = "poslední díl nemá v Cinemetě číslo řady/dílu"
+                    elif (int(s), int(e)) != (ls, le) and (ls, le) != (0, 0):
                         out["verified"] = False
                         out["reason"] = (f"pořadí nesedí: Stremio říká S{ls}E{le}, "
                                          f"mapování dává S{s}E{e}")
@@ -176,41 +209,69 @@ def stremio_state(item: dict) -> dict:
     return out
 
 
-def trakt_episode_inventory(imdb: str) -> set[tuple[int, int]]:
-    """Všechny epizody, které Trakt u seriálu zná (pro kontrolu, že mapování dává smysl)."""
-    cache_path = HERE / "trakt_episodes_cache.json"
-    cache = json.loads(cache_path.read_text()) if cache_path.exists() else {}
-    if imdb in cache:
-        return {tuple(x) for x in cache[imdb]}
+# --------------------------------------------------------------- trakt čtení
+# Všechny tyhle funkce při chybě výjimku propustí. Prázdná množina tu znamená
+# „Trakt opravdu nic nemá“, nikdy „nepovedlo se to přečíst“.
+
+
+_WATCHED_SHOWS: dict | None = None
+
+
+def trakt_watched_shows(refresh: bool = False) -> dict[str, set]:
+    """Všechny zhlédnuté díly všech seriálů jedním voláním `/sync/watched/shows`.
+
+    Klíč je IMDb ID a `trakt:<id>`. Na rozdíl od `/shows/{id}/progress/watched` sem
+    patří i skryté řady — jinak by se díly z nich doplňovaly každou noc znovu.
+    """
+    global _WATCHED_SHOWS
+    if _WATCHED_SHOWS is None or refresh:
+        import track
+        rows = track._req("GET", "/sync/watched/shows")[0]
+        if not isinstance(rows, list):
+            raise track.TraktError("/sync/watched/shows nevrátil seznam")
+        out: dict[str, set] = {}
+        for r in rows:
+            ids = (r.get("show") or {}).get("ids") or {}
+            eps = {(int(s["number"]), int(e["number"]))
+                   for s in r.get("seasons") or [] for e in s.get("episodes") or []}
+            for key in (ids.get("imdb"), f"trakt:{ids['trakt']}" if ids.get("trakt") else None):
+                if key:
+                    out.setdefault(key, set()).update(eps)
+        _WATCHED_SHOWS = out
+    return _WATCHED_SHOWS
+
+
+def trakt_watched_episodes(imdb: str, refresh: bool = False) -> set[tuple[int, int]]:
+    return set(trakt_watched_shows(refresh).get(imdb, set()))
+
+
+def trakt_watched_movies() -> set[str]:
+    """Zhlédnuté filmy přímo z Traktu. Žádný fallback na lokální DB — ta je starší
+    a film scrobblovaný dnes by se zapsal podruhé."""
     import track
-    try:
+    rows = track._req("GET", "/sync/watched/movies")[0]
+    if not isinstance(rows, list):
+        raise track.TraktError("/sync/watched/movies nevrátil seznam")
+    return {((r.get("movie") or {}).get("ids") or {}).get("imdb") for r in rows} - {None}
+
+
+def trakt_seasons(imdb: str, refresh: bool = False) -> dict[tuple[int, int], str]:
+    """Díly, které Trakt u seriálu zná, s názvy: {(season, episode): title}."""
+    cache = common.JsonCache(TRAKT_EPISODES_CACHE, _ttl())
+    hit = None if refresh else cache.get(imdb)
+    if not hit:
+        import track
         seasons = track._req("GET", f"/shows/{imdb}/seasons", params={"extended": "episodes"})[0]
-    except Exception as e:
-        print(f"  ! seznam epizod pro {imdb} selhal: {e}", file=sys.stderr)
-        return set()
-    inv = set()
-    for season in seasons or []:
-        for ep in season.get("episodes") or []:
-            inv.add((int(season["number"]), int(ep["number"])))
-    cache[imdb] = sorted(inv)
-    cache_path.write_text(json.dumps(cache, ensure_ascii=False))
-    return inv
+        if not isinstance(seasons, list):
+            raise track.TraktError(f"/shows/{imdb}/seasons nevrátil seznam")
+        hit = {f"{int(s['number'])}:{int(e['number'])}": e.get("title") or ""
+               for s in seasons for e in s.get("episodes") or []}
+        cache.put(imdb, hit)
+    return {tuple(int(x) for x in k.split(":")): v for k, v in hit.items()}
 
 
-def trakt_watched_episodes(imdb: str) -> set[tuple[int, int]]:
-    import track
-    try:
-        pr = track._req("GET", f"/shows/{imdb}/progress/watched",
-                        params={"hidden": "false", "specials": "true"})[0]
-    except Exception as e:
-        print(f"  ! Trakt pro {imdb} selhal: {e}", file=sys.stderr)
-        return set()
-    done = set()
-    for season in pr.get("seasons") or []:
-        for ep in season.get("episodes") or []:
-            if ep.get("completed"):
-                done.add((int(season["number"]), int(ep["number"])))
-    return done
+def trakt_episode_inventory(imdb: str, refresh: bool = False) -> set[tuple[int, int]]:
+    return set(trakt_seasons(imdb, refresh))
 
 
 def load_alias() -> dict:
@@ -220,25 +281,6 @@ def load_alias() -> dict:
         return {}
     data = json.loads(p.read_text())
     return {k: v for k, v in data.items() if not k.startswith("_")}
-
-
-def trakt_watched_movies() -> set[str]:
-    """Zhlédnuté filmy přímo z Traktu (ne z lokální DB, ta může být starší)."""
-    import track
-    try:
-        rows = track.paged("/sync/history/movies", {"extended": "full"})
-        ids = {((r.get("movie") or {}).get("ids") or {}).get("imdb") for r in rows}
-        return {i for i in ids if i}
-    except Exception as e:
-        print(f"  ! historii filmů z Traktu nešlo přečíst ({e}), beru lokální DB", file=sys.stderr)
-        con = sqlite3.connect(HERE / "tracker.db")
-        try:
-            rows = con.execute("SELECT imdb FROM watched_movies WHERE imdb IS NOT NULL").fetchall()
-        except sqlite3.OperationalError:
-            rows = []
-        finally:
-            con.close()
-        return {r[0] for r in rows}
 
 
 # ------------------------------------------------------------------ příkazy
@@ -253,7 +295,11 @@ def cmd_list(_args: argparse.Namespace) -> None:
     print()
     print("Seriály:")
     for it in sorted(series, key=lambda x: (x.get("state") or {}).get("lastWatched") or "", reverse=True):
-        st = stremio_state(it)
+        try:
+            st = stremio_state(it)
+        except (BridgeError, ValueError) as e:
+            print(f"  {it.get('name')} — ⚠ {e}")
+            continue
         err = f"  ⚠ {st['error']}" if st.get("error") else ""
         print(f"  {it.get('name')} — {len(st['watched'])} epizod, naposledy {st['last'] or '?'}{err}")
     print()
@@ -270,24 +316,28 @@ def compute_gaps() -> dict:
     gaps = {"movies": [], "shows": [], "unknown": []}
 
     for it in items:
-        st = stremio_state(it)
         imdb = it.get("_id") or ""
+        try:
+            st = stremio_state(it)
+        except (BridgeError, ValueError) as e:
+            gaps["unknown"].append({"name": it.get("name"), "imdb": imdb, "reason": str(e)})
+            continue
         if st.get("error"):
-            gaps["unknown"].append({"name": st["name"], "reason": st["error"]})
+            gaps["unknown"].append({"name": st["name"], "imdb": imdb, "reason": st["error"]})
             continue
         if not st["watched"]:
             continue
         trakt_id = alias.get(imdb, imdb)
-        trakt_movies = {alias.get(m, m) for m in trakt_movies} if alias else trakt_movies
         if st["kind"] == "series":
             if not st.get("verified"):
-                gaps["unknown"].append({"name": st["name"], "reason": st.get("reason") or "neověřeno"})
+                gaps["unknown"].append({"name": st["name"], "imdb": imdb,
+                                        "reason": st.get("reason") or "neověřeno"})
                 continue
             inventory = trakt_episode_inventory(trakt_id)
-            bogus = sorted(p for p in st["watched"] if inventory and p not in inventory)
+            bogus = sorted(p for p in st["watched"] if p not in inventory)
             if bogus:
                 gaps["unknown"].append({
-                    "name": st["name"],
+                    "name": st["name"], "imdb": imdb,
                     "reason": f"mapování dává neexistující epizody ({len(bogus)}), např. "
                               + ", ".join(f"S{a}E{b}" for a, b in bogus[:3])})
                 continue
@@ -332,18 +382,57 @@ def cmd_compare(_args: argparse.Namespace) -> None:
         print("  → pro tyhle použij `forward`: doplní jen mezeru k poslednímu dokoukanému dílu")
     total = len(gaps["movies"]) + sum(len(s["missing"]) for s in gaps["shows"])
     print(f"\nCelkem chybí {total} položek.")
-    (HERE / "gaps.json").write_text(json.dumps(gaps, indent=2, ensure_ascii=False))
+    common.atomic_write_json(GAPS, gaps, indent=2)
     print("Uloženo do gaps.json.")
 
 
+# ----------------------------------------------------------------- zápisy
+
+
+def _record_pushed(pairs_by_show: dict[str, list]) -> None:
+    """pushed.json: co most zapsal (pro `redate`). Bez duplicit."""
+    pushed = common.read_json(PUSHED, {"movies": [], "episodes": []})
+    have = {tuple(x) for x in pushed.get("episodes") or []}
+    for imdb, pairs in pairs_by_show.items():
+        for a, b in pairs:
+            have.add((imdb, int(a), int(b)))
+    pushed["episodes"] = sorted([list(x) for x in have])
+    common.atomic_write_json(PUSHED, pushed)
+
+
+def _journal_update(journal: common.Journal, result: dict) -> None:
+    """Přepíše deník podle výsledku zápisu (volá se po každém requestu)."""
+    shows: dict[str, dict] = {}
+    for i in result["added"]:
+        if i["kind"] == "episode":
+            row = shows.setdefault(i["ids"].get("imdb") or str(i["ids"]),
+                                   {"imdb": i["ids"].get("imdb"), "name": i.get("name"), "pairs": []})
+            row["pairs"].append([i["season"], i["episode"]])
+    journal["movies"] = [{"imdb": i["ids"].get("imdb"), "name": i.get("name")}
+                         for i in result["added"] if i["kind"] == "movie"]
+    journal["shows" if "shows" in journal.data else "written"] = list(shows.values())
+    journal["denied"] = list(result["denied"])
+    journal["repeat"] = [{"name": i.get("name"), "key": writes.item_key(i)} for i in result["repeat"]]
+    journal.save()
+
+
+def _report_write(result: dict) -> None:
+    if result["repeat"]:
+        print(f"  ! {len(result['repeat'])} položek přeskočeno — stejný zápis proběhl v posledních "
+              f"{common.settings()['repeat_guard_days']} dnech (anomálie, Trakt by počítal další "
+              "zhlédnutí; prověř, proč je Trakt nevidí; --force-repeat zapíše i tak)")
+        for i in result["repeat"][:10]:
+            print(f"     {writes.item_key(i)}")
+    for d in result["denied"]:
+        print(f"  ! {d}")
+
+
 def cmd_push(args: argparse.Namespace) -> None:
-    gaps_path = HERE / "gaps.json"
-    if not gaps_path.exists():
+    if not GAPS.exists():
         sys.exit("Nejdřív spusť: python3 stremio_bridge.py compare")
-    gaps = json.loads(gaps_path.read_text())
+    gaps = json.loads(GAPS.read_text())
     # Nefiltrujeme podle pushed.json: o tom, co chybí, rozhoduje živý stav Traktu
-    # (gaps.json). Když se záznam v Traktu ztratí, most ho má doplnit znovu.
-    # pushed.json slouží jen pro `redate` (co jsme zapsali bez data).
+    # (gaps.json). Opakovanému zápisu téhož brání pojistka ve writes.py.
     movies = list(gaps["movies"])
     shows = []
     skipped_specials = 0
@@ -358,7 +447,7 @@ def cmd_push(args: argparse.Namespace) -> None:
 
     print(f"K zápisu: {len(movies)} filmů, {sum(len(s['missing']) for s in shows)} epizod")
     if skipped_specials:
-        print(f"  (vynecháno {skipped_specials} speciálů S0 – přidej --include-specials, pokud je chceš)" )
+        print(f"  (vynecháno {skipped_specials} speciálů S0 – přidej --include-specials, pokud je chceš)")
     for m in movies:
         print(f"  film: {m['name']} ({m['last'][:10] if m.get('last') else 'unknown'})")
     for s in shows:
@@ -368,54 +457,22 @@ def cmd_push(args: argparse.Namespace) -> None:
         print("\n(Dry-run. Pro skutečný zápis přidej --yes.)")
         return
 
-    import track
-    pushed = json.loads(PUSHED.read_text()) if PUSHED.exists() else {"movies": [], "episodes": []}
-    journal = {"movies": [], "shows": [], "denied": []}
-    # filmy
-    if movies:
-        payload = {"movies": [{"ids": {"imdb": m["imdb"]},
-                               "watched_at": m["last"] or "unknown"} for m in movies]}
-        res = track._req("POST", "/sync/history", body=payload)[0]
-        added = (res.get("added") or {}).get("movies") or 0
-        nf = (res.get("not_found") or {}).get("movies") or []
-        print(f"  filmy: zapsáno {added} z {len(movies)} | nenalezeno: {len(nf)}")
-        if nf:
-            names = [x.get("title") or "?" for x in nf]
-            journal["denied"] += names
-            print("   nenalezené:", ", ".join(names))
-        if added == len(movies):
-            pushed["movies"].extend(m["imdb"] for m in movies)
-            journal["movies"] = [{"imdb": m["imdb"], "name": m["name"]} for m in movies]
-        else:
-            journal["denied"].append(f"filmy: Trakt přijal {added} z {len(movies)}")
-            print("  ! ne všechno prošlo, do pushed.json neukládám "
-                  "(spusť compare a pak push znovu)")
-        time.sleep(1.2)
-
-    # epizody – po seriálech, poslední epizoda s přesným datem, starší jako unknown
+    items = [writes.movie_item({"imdb": m["imdb"]}, m.get("last"), m["name"]) for m in movies]
     for s in shows:
-        seasons: dict[int, list] = {}
         last_ep = tuple(s.get("last_ep") or ())
         for a, b in s["missing"]:
-            when = s["last"] if (a, b) == last_ep else "unknown"
-            seasons.setdefault(a, []).append({"number": b, "watched_at": when or "unknown"})
-        payload = {"shows": [{"ids": {"imdb": s["imdb"]},
-                              "seasons": [{"number": num, "episodes": eps}
-                                          for num, eps in sorted(seasons.items())]}]}
-        res = track._req("POST", "/sync/history", body=payload)[0]
-        added = (res.get("added") or {}).get("episodes") or 0
-        print(f"  {s['name']}: zapsáno {added} z {len(s['missing'])} epizod")
-        if added == len(s["missing"]):
-            pushed["episodes"].extend([s["imdb"], a, b] for a, b in s["missing"])
-            journal["shows"].append({"imdb": s["imdb"], "name": s["name"], "pairs": s["missing"]})
-        else:
-            journal["denied"].append(f"{s['name']}: {added} z {len(s['missing'])}")
-            print(f"  ! {s['name']}: neprošlo všechno (Trakt tenhle seriál možná nezná pod tímhle ID)")
-        time.sleep(1.2)
+            # přesné datum zná Stremio jen u posledního dílu; starší jsou "unknown"
+            when = s["last"] if (a, b) == last_ep else None
+            items.append(writes.episode_item({"imdb": s["imdb"]}, a, b, when, s["name"]))
 
-    PUSHED.write_text(json.dumps(pushed, indent=1, ensure_ascii=False))
-    (HERE / "last_push.json").write_text(json.dumps(journal, ensure_ascii=False, indent=1))
-    print("\nHotovo. Zápis je v pushed.json, aby se nic neposílalo dvakrát.")
+    journal = common.Journal(LAST_PUSH, {"movies": [], "shows": [], "denied": [], "repeat": []})
+    result = writes.add_history(items, cmd="push", force_repeat=args.force_repeat,
+                                on_progress=lambda r: _journal_update(journal, r))
+    _journal_update(journal, result)
+    _record_pushed({row["imdb"]: row["pairs"] for row in journal["shows"]})
+    print(f"  zapsáno: {sum(1 for i in result['added'] if i['kind'] == 'movie')} filmů, "
+          f"{sum(1 for i in result['added'] if i['kind'] == 'episode')} epizod")
+    _report_write(result)
 
 
 def cmd_forward(args: argparse.Namespace) -> None:
@@ -439,8 +496,6 @@ def cmd_forward(args: argparse.Namespace) -> None:
         _sid, se, ep, _n, idx = decode_watched(w)
         imdb = alias.get(it.get("_id"), it.get("_id"))
         inv = sorted(trakt_episode_inventory(imdb))
-        if not inv:
-            continue
         if (se, ep) not in inv:
             skipped.append(f"{it.get('name')}: Stremio uvádí poslední dokoukaný S{se}E{ep}, "
                            f"takový díl Trakt u {imdb} nezná")
@@ -448,7 +503,8 @@ def cmd_forward(args: argparse.Namespace) -> None:
         done = trakt_watched_episodes(imdb)
         mx = max(done) if done else None
         start = inv.index(mx) + 1 if mx in inv else 0
-        todo = [e for e in inv[start:inv.index((se, ep)) + 1] if e not in done]
+        todo = [e for e in inv[start:inv.index((se, ep)) + 1]
+                if e not in done and (e[0] != 0 or args.include_specials)]
         if not todo:
             continue
         rows.append({"name": it.get("name"), "imdb": imdb, "marker": (se, ep),
@@ -469,46 +525,34 @@ def cmd_forward(args: argparse.Namespace) -> None:
         for s in skipped:
             print(f"  {s}")
 
-    (HERE / "forward.json").write_text(json.dumps(
-        [r for r in rows if args.only is None or r["imdb"] == args.only],
-        indent=2, ensure_ascii=False))
-    total = sum(len(r["todo"]) for r in rows if args.only is None or r["imdb"] == args.only)
-    print(f"\nCelkem k doplnění: {total} dílů.")
+    selected = [r for r in rows if args.only is None or r["imdb"] == args.only]
+    common.atomic_write_json(HERE / "forward.json", selected, indent=2)
+    print(f"\nCelkem k doplnění: {sum(len(r['todo']) for r in selected)} dílů.")
     if not args.yes:
         print("(Dry-run. Pro zápis přidej --yes. Upsat datum: --date unknown, nebo výchozí = den posledního dílu.)")
         return
 
-    import track
-    journal = {"written": [], "denied": [], "over_max": []}
-    selected = [r for r in rows if args.only is None or r["imdb"] == args.only]
     to_write = [r for r in selected if args.max is None or len(r["todo"]) <= args.max]
-    journal["over_max"] = [{"imdb": r["imdb"], "name": r["name"], "todo": r["todo"],
-                            "marker": r["marker"]} for r in selected if r not in to_write]
-    if args.yes and len(to_write) < len(selected):
-        for r in selected:
-            if r not in to_write:
-                print(f"  {r['name']}: {len(r['todo'])} dílů – přes limit --max={args.max}, "
-                      f"nechávám ke schválení (zapiš ručně s --only {r['imdb']})")
-    pushed = json.loads(PUSHED.read_text()) if PUSHED.exists() else {"movies": [], "episodes": []}
+    journal = common.Journal(LAST_FORWARD, {
+        "written": [], "denied": [], "repeat": [], "skipped": skipped,
+        "over_max": [{"imdb": r["imdb"], "name": r["name"], "todo": r["todo"],
+                      "marker": r["marker"]} for r in selected if r not in to_write]})
+    for r in selected:
+        if r not in to_write:
+            print(f"  {r['name']}: {len(r['todo'])} dílů – přes limit --max={args.max}, "
+                  f"nechávám ke schválení (zapiš ručně s --only {r['imdb']})")
+    items = []
     for r in to_write:
-        when = args.date or r["last"] or "unknown"
-        seasons: dict[int, list] = {}
-        for a, b in r["todo"]:
-            seasons.setdefault(a, []).append({"number": b, "watched_at": when})
-        payload = {"shows": [{"ids": {"imdb": r["imdb"]},
-                              "seasons": [{"number": n, "episodes": e}
-                                          for n, e in sorted(seasons.items())]}]}
-        res = track._req("POST", "/sync/history", body=payload)[0]
-        added = (res.get("added") or {}).get("episodes") or 0
-        print(f"  {r['name']}: zapsáno {added} z {len(r['todo'])}")
-        if added == len(r["todo"]):
-            pushed["episodes"].extend([r["imdb"], a, b] for a, b in r["todo"])
-            journal["written"].append({"imdb": r["imdb"], "name": r["name"], "pairs": r["todo"]})
-        else:
-            journal["denied"].append(f"{r['name']}: {added} z {len(r['todo'])}")
-        time.sleep(1.2)
-    PUSHED.write_text(json.dumps(pushed, indent=1, ensure_ascii=False))
-    (HERE / "last_forward.json").write_text(json.dumps(journal, ensure_ascii=False, indent=1))
+        when = args.date or r["last"]
+        when = None if when == "unknown" else when
+        items += [writes.episode_item({"imdb": r["imdb"]}, a, b, when, r["name"]) for a, b in r["todo"]]
+    result = writes.add_history(items, cmd="forward", force_repeat=args.force_repeat,
+                                on_progress=lambda res: _journal_update(journal, res))
+    _journal_update(journal, result)
+    _record_pushed({row["imdb"]: row["pairs"] for row in journal["written"]})
+    for row in journal["written"]:
+        print(f"  {row['name']}: zapsáno {len(row['pairs'])}")
+    _report_write(result)
 
 
 def cmd_redate(args: argparse.Namespace) -> None:
@@ -517,7 +561,8 @@ def cmd_redate(args: argparse.Namespace) -> None:
     Stremio zná jen datum posledního zhlédnutého dílu. Zápis s 'unknown' je sice
     pravdivý, ale nepočítá se do statistik, takže tenhle příkaz historii přepíše.
     """
-    pushed = json.loads(PUSHED.read_text()) if PUSHED.exists() else {"movies": [], "episodes": []}
+    import track
+    pushed = common.read_json(PUSHED, {"movies": [], "episodes": []})
     eps = pushed.get("episodes") or []
     if not eps:
         sys.exit("Nic k přepisu – pushed.json je prázdný.")
@@ -534,7 +579,6 @@ def cmd_redate(args: argparse.Namespace) -> None:
     if not groups:
         sys.exit("Nic k přepisu pro zadaný filtr.")
 
-    import track
     for imdb, pairs in sorted(groups.items()):
         when = args.date or last_by_id.get(imdb)
         if not when:
@@ -555,8 +599,9 @@ def cmd_redate(args: argparse.Namespace) -> None:
         res = track._req("POST", "/sync/history", body=add_body)[0]
         print("    znovu zapsáno:", (res.get("added") or {}).get("episodes"))
         time.sleep(1.2)
-        hist = track.paged(f"/sync/history/shows/{imdb}", {"limit": "200"})
-        print(f"    kontrola: v historii Traktu teď {len(hist)} záznamů (čekáno {len(pairs)})")
+
+
+# ---------------------------------------------------------- párování dílů
 
 
 def _norm_title(t: str, keep_parts: bool = False) -> str:
@@ -574,80 +619,128 @@ def _norm_title(t: str, keep_parts: bool = False) -> str:
     return re.sub(r"\s+", " ", t).strip().removeprefix("the ")
 
 
-def trakt_titles(imdb: str) -> dict[tuple[int, int], str]:
-    """Názvy epizod podle Traktu: {(season, episode): title}. Kvůli mapování z Cinetemy."""
-    cache_path = HERE / "trakt_titles_cache.json"
-    cache = json.loads(cache_path.read_text()) if cache_path.exists() else {}
-    if imdb not in cache:
-        import track
-        try:
-            seasons = track._req("GET", f"/shows/{imdb}/seasons",
-                                 params={"extended": "episodes"})[0]
-        except Exception as e:
-            print(f"  ! seznam epizod pro {imdb} selhal: {e}", file=sys.stderr)
-            return {}
-        cache[imdb] = {f"{int(s['number'])}:{int(e['number'])}": e.get("title") or ""
-                       for s in seasons or [] for e in s.get("episodes") or []}
-        cache_path.write_text(json.dumps(cache, ensure_ascii=False))
-    return {tuple(int(x) for x in k.split(":")): v for k, v in cache[imdb].items()}
+PART_MARK = re.compile(r"\((?:\d|part\s*\d)\)\s*$|\bpart\s*\d+\b")
 
 
-def map_cinemeta_pairs(imdb: str, cm_pairs: set) -> dict:
-    """Přeloží dvojice z číslování Cinemety do číslování Traktu.
+def _ratio(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a, b).ratio()
 
-    Cinemeta dělí hodinové díly na dva záznamy („Fun Run (1)“ a „(2)“), Trakt je vede
-    jako jeden. Mapuje se podle názvu, v rámci jedné řady a pořadí (monotónně), takže
-    se záměna mezi řadami nemůže stát. Co se namapovat nedá, se vrátí ve `unmatched`
-    a do Traktu se neposílá.
+
+def align_season(cm: list[tuple[int, str]], tr: list[tuple[int, str]],
+                 threshold: float = 0.6) -> list[int | None]:
+    """Zarovná všechny díly jedné řady Cinemety na díly Traktu.
+
+    `cm` a `tr` jsou [(číslo dílu, název)] v pořadí. Vrátí pro každý prvek `cm` číslo
+    dílu v Traktu, nebo None. Dvojice se drží pořadí (monotónně); dva sousední díly
+    Cinemety smí padnout na jeden díl Traktu (hodinový díl rozdělený na „(1)/(2)“).
+
+    1) Stejný počet dílů a názvy na stejných pozicích většinou sedí (nebo se nedají
+       porovnat, např. samé „Episode N“/„TBA“) → rozhoduje číslo dílu.
+    2) Jinak globální zarovnání (DP) přes celé sekvence: skóre je podobnost názvů,
+       shoda čísla dílu je jen malý bonus pro remízy.
     """
-    videos = cinemeta_videos(imdb)
-    titles = trakt_titles(imdb)
-    by_season: dict[int, list[tuple[int, str]]] = {}
-    for (s, e), t in titles.items():
-        by_season.setdefault(s, []).append((e, t))
-    for s in by_season:
-        by_season[s].sort()
+    n, m = len(cm), len(tr)
+    if not n or not m:
+        return [None] * n
+    full_a = [_norm_title(t, keep_parts=True) for _, t in cm]
+    strip_a = [_norm_title(t) for _, t in cm]
+    full_b = [_norm_title(t, keep_parts=True) for _, t in tr]
+    strip_b = [_norm_title(t) for _, t in tr]
+    parted = [bool(PART_MARK.search((t or "").lower())) for _, t in cm]
 
+    def sim(i: int, j: int) -> float:
+        if not strip_a[i] or not strip_b[j]:
+            base = threshold        # bez názvu nevíme nic; rozhodne pořadí a číslo
+        else:
+            base = max(_ratio(full_a[i], full_b[j]), _ratio(strip_a[i], strip_b[j]) - 0.02)
+        return base + (0.05 if cm[i][0] == tr[j][0] else 0.0)
+
+    if n == m and [e for e, _ in cm] == [e for e, _ in tr]:
+        comparable = [i for i in range(n) if strip_a[i] and strip_b[i]]
+        agree = sum(1 for i in comparable if sim(i, i) >= threshold + 0.05)
+        if not comparable or agree * 2 >= len(comparable):
+            return [e for e, _ in tr]
+
+    neg = float("-inf")
+    # A[i][j]: nejlepší skóre pro prvních i dílů cm, kde díl i-1 padl na tr j-1
+    # B[i][j]: nejlepší skóre pro prvních i dílů cm při použití tr[0:j]
+    A = [[neg] * (m + 1) for _ in range(n + 1)]
+    B = [[0.0] * (m + 1) for _ in range(n + 1)]
+    how_a: dict[tuple[int, int], str] = {}
+    how_b: dict[tuple[int, int], str] = {}
+    for i in range(1, n + 1):
+        how_b[(i, 0)] = "skip_cm"
+        for j in range(1, m + 1):
+            s = sim(i - 1, j - 1)
+            if s >= threshold:
+                best, how = B[i - 1][j - 1] + s, "new"
+                # druhá polovina téhož dílu Traktu: jen když má díl Cinemety značku
+                # „(1)/(2)“ a bez ní název sedí — „Episode 12“ na „Episode 11“ nesmí
+                if (A[i - 1][j] > neg and parted[i - 1] and strip_b[j - 1]
+                        and _ratio(strip_a[i - 1], strip_b[j - 1]) >= 0.9):
+                    rep = A[i - 1][j] + s - 0.1
+                    if rep > best:
+                        best, how = rep, "repeat"
+                A[i][j], how_a[(i, j)] = best, how
+            cands = [(A[i][j], "match"), (B[i][j - 1], "skip_tr"), (B[i - 1][j], "skip_cm")]
+            B[i][j], how_b[(i, j)] = max(cands, key=lambda c: c[0])
+
+    out: list[int | None] = [None] * n
+    i, j, in_a = n, m, False
+    while i > 0:
+        if in_a:
+            out[i - 1] = tr[j - 1][0]
+            if how_a[(i, j)] == "repeat":
+                i -= 1
+            else:
+                i, j, in_a = i - 1, j - 1, False
+            continue
+        step = how_b[(i, j)] if j > 0 else "skip_cm"
+        if step == "skip_tr":
+            j -= 1
+        elif step == "skip_cm":
+            i -= 1
+        else:
+            in_a = True
+    return out
+
+
+def map_pairs(videos: list, titles: dict, cm_pairs: set, threshold: float = 0.6) -> dict:
+    """Přeloží zhlédnuté dvojice z číslování Cinemety do číslování Traktu.
+
+    `videos` jsou videa Cinemety ([id, season, episode, title]), `titles` díly Traktu
+    {(s, e): title}. Zarovnávají se celé řady (i nezhlédnuté díly), ne jen zhlédnuté —
+    jen tak se dá spolehlivě přeskočit mezera v sledování.
+    """
+    tr_by_season: dict[int, list[tuple[int, str]]] = {}
+    for (s, e), t in titles.items():
+        tr_by_season.setdefault(s, []).append((e, t))
     mapped: set = set()
     unmatched: list = []
     parts: dict = {}
     for season in sorted({s for s, _ in cm_pairs}):
-        candidates = by_season.get(season) or []
-        marked = [v for v in videos if v[0] == season and (v[0], v[1]) in cm_pairs]
-        if not candidates:
-            unmatched += [(s, e, t) for s, e, t in marked]
-            continue
-        pointer = 0
-        for _s, _e, title in marked:
-            want = _norm_title(title)
-            want_full = _norm_title(title, keep_parts=True)
-            # 1) přesná shoda včetně značky (1)/(2) — rozhodne tam, kde ji má i Trakt
-            exact = None
-            for j in range(pointer, min(pointer + 4, len(candidates))):
-                if _norm_title(candidates[j][1], keep_parts=True) == want_full:
-                    exact = j
-                    break
-            if exact is not None:
-                pointer = exact
-                pair = (season, candidates[exact][0])
-                mapped.add(pair)
-                parts[pair] = parts.get(pair, 0) + 1
+        cm = [(int(v[2]), v[3]) for v in videos
+              if v[1] is not None and v[2] is not None and int(v[1]) == season]
+        tr = sorted(tr_by_season.get(season) or [])
+        result = align_season(cm, tr, threshold)
+        for (e, title), te in zip(cm, result):
+            if (season, e) not in cm_pairs:
                 continue
-            # 2) bez značky — tam, kde Trakt hodinový díl vede jako jeden
-            best, best_ratio = None, 0.0
-            for j in range(pointer, min(pointer + 4, len(candidates))):
-                ratio = difflib.SequenceMatcher(None, want, _norm_title(candidates[j][1])).ratio()
-                if ratio > best_ratio:
-                    best, best_ratio = j, ratio
-            if best is None or best_ratio < 0.6:
-                unmatched.append((season, _e, title))
-                continue
-            pointer = best
-            pair = (season, candidates[best][0])
-            mapped.add(pair)
-            parts[pair] = parts.get(pair, 0) + 1
+            if te is None:
+                unmatched.append((season, e, title))
+            else:
+                mapped.add((season, te))
+                parts[(season, te)] = parts.get((season, te), 0) + 1
+        known = {e for e, _ in cm}
+        unmatched += [(season, e, "") for s, e in sorted(cm_pairs) if s == season and e not in known]
     return {"mapped": mapped, "unmatched": unmatched,
-            "parts": {p: n for p, n in parts.items() if n > 1}}
+            "parts": {p: k for p, k in parts.items() if k > 1}}
+
+
+def map_cinemeta_pairs(stremio_id: str, trakt_id: str, cm_pairs: set) -> dict:
+    """Cinemeta se ptá pod Stremio ID (z něj vznikla bitová mapa), Trakt pod svým."""
+    return map_pairs(cinemeta_videos(stremio_id), trakt_seasons(trakt_id), cm_pairs,
+                     float(common.settings()["match_threshold"]))
 
 
 def cmd_exact(args: argparse.Namespace) -> None:
@@ -656,27 +749,31 @@ def cmd_exact(args: argparse.Namespace) -> None:
     `push` jen doplňuje a `forward` doplní mezeru k poslednímu dokoukanému dílu; oba
     nechají v Traktu i díly, které uživatel přeskočil. Tenhle příkaz udělá z Traktu
     zrcadlo Stremia: co Stremio jako zhlédnuté nevede, z Traktu zmizí.
+
+    Pojistky: když se něco nenamapuje nebo je cíl prázdný, nic se nemění. Nejdřív se
+    doplňuje, pak maže; mazané záznamy (s history id a původním datem) jdou do deníku
+    a do write_log.jsonl ještě před smazáním.
     """
-    import track
     alias = load_alias()
     items = fetch_raw()
     item = next((i for i in items
                  if i.get("_id") == args.only or alias.get(i.get("_id")) == args.only), None)
     if item is None:
         sys.exit(f"V knihovně Stremia není {args.only}.")
+    stremio_id = item.get("_id")
     st = stremio_state(item)
-    trakt_id = alias.get(item.get("_id"), item.get("_id"))
+    trakt_id = alias.get(stremio_id, stremio_id)
     if st.get("error") or not st.get("verified"):
         sys.exit(f"{st['name']}: mapování není ověřené ({st.get('error') or st.get('reason')}), "
                  "použij `forward`.")
     if not st["watched"]:
         sys.exit(f"{st['name']}: Stremio nic zhlédnuté nehlásí.")
 
-    res = map_cinemeta_pairs(trakt_id, st["watched"])
+    res = map_cinemeta_pairs(stremio_id, trakt_id, st["watched"])
     target = {p for p in res["mapped"] if p[0] != 0 or args.include_specials}
-    current = trakt_watched_episodes(trakt_id)
+    current = trakt_watched_episodes(trakt_id, refresh=True)
     add = sorted(target - current)
-    remove = sorted(current - target)
+    remove = sorted(p for p in current - target if p[0] != 0 or args.include_specials)
 
     print(f"{st['name']} ({trakt_id})")
     print(f"  Stremio označuje {len(st['watched'])} dílů → v číslování Traktu {len(target)}")
@@ -688,36 +785,70 @@ def cmd_exact(args: argparse.Namespace) -> None:
         print(f"  (u {len(res['parts'])} dílů má Cinemeta dva půldíly, Trakt jeden — počítá se jako jeden)")
     print(f"  doplnit: {len(add)}" + (f" {add}" if len(add) <= 20 else ""))
     print(f"  odebrat: {len(remove)}" + (f" {remove}" if len(remove) <= 20 else ""))
+    if not target:
+        print("\nCíl je prázdný — nic neměním (to by smazalo celý seriál).", file=sys.stderr)
+        sys.exit(common.EXIT_REFUSED)
+    if res["unmatched"] and not args.allow_unmatched:
+        print("\nNěco se nenamapovalo — nic neměním. Nenamapovaný díl by z Traktu zmizel, "
+              "i když ho Stremio vede jako zhlédnutý. (--allow-unmatched to dovolí.)",
+              file=sys.stderr)
+        sys.exit(common.EXIT_REFUSED)
     if not args.yes:
         print("\n(Dry-run. Pro skutečnou změnu přidej --yes.)")
         return
 
-    journal = {"imdb": trakt_id, "name": st["name"], "add": add, "remove": remove,
-               "target": len(target)}
+    journal = common.Journal(LAST_EXACT, {
+        "imdb": trakt_id, "name": st["name"], "target": len(target),
+        "add": add, "remove": remove, "remove_entries": [], "added": [], "removed": [],
+        "denied": [], "repeat": [], "status": "started"})
     if remove:
-        seasons = sorted({p[0] for p in remove})
-        body = {"shows": [{"ids": {"imdb": trakt_id}, "seasons": [
-            {"number": s, "episodes": [{"number": e} for ss, e in remove if ss == s]}
-            for s in seasons]}]}
-        track._req("POST", "/sync/history/remove", body=body)
-        print(f"  odebráno {len(remove)} dílů")
-        time.sleep(1.2)
-    if add:
-        when = args.date or "unknown"
-        seasons = sorted({p[0] for p in add})
-        body = {"shows": [{"ids": {"imdb": trakt_id}, "seasons": [
-            {"number": s, "episodes": [{"number": e, "watched_at": when} for ss, e in add if ss == s]}
-            for s in seasons]}]}
-        res2 = track._req("POST", "/sync/history", body=body)[0]
-        got = (res2.get("added") or {}).get("episodes") or 0
-        print(f"  zapsáno {got} z {len(add)}")
-        journal["added"] = got
-        time.sleep(1.2)
+        history = writes.fetch_show_history(trakt_id)
+        remove_set = set(remove)
+        journal["remove_entries"] = [h for h in history
+                                     if (h["season"], h["episode"]) in remove_set]
+        journal.save()          # co se bude mazat, je na disku dřív, než se to smaže
 
-    after = trakt_watched_episodes(trakt_id)
-    print(f"  kontrola: Trakt teď má {len(after)}, cíl {len(target)} → "
-          f"{'sedí' if after == target else 'NESEDÍ: ' + str(sorted(after ^ target)[:10])}")
-    (HERE / "last_exact.json").write_text(json.dumps(journal, ensure_ascii=False, indent=1))
+    if add:
+        when = None if args.date in (None, "unknown") else args.date
+        items_add = [writes.episode_item({"imdb": trakt_id}, s, e, when, st["name"]) for s, e in add]
+        result = writes.add_history(items_add, cmd="exact", force_repeat=args.force_repeat)
+        journal["added"] = [[i["season"], i["episode"]] for i in result["added"]]
+        journal["denied"] = result["denied"]
+        journal["repeat"] = [writes.item_key(i) for i in result["repeat"]]
+        journal.save()
+        print(f"  zapsáno {len(result['added'])} z {len(add)}")
+        _report_write(result)
+        if len(result["added"]) != len(add):
+            journal["status"] = "stopped: add incomplete, nothing removed"
+            journal.save()
+            print("  ! doplnění neprošlo celé — nic nemažu", file=sys.stderr)
+            sys.exit(common.EXIT_ERROR)
+
+    if journal["remove_entries"]:
+        rres = writes.remove_history(journal["remove_entries"], cmd="exact")
+        journal["removed"] = rres["removed"]
+        journal.save()
+        print(f"  odebráno {len(rres['removed'])} záznamů historie ({len(remove)} dílů)"
+              + (f", nenalezeno {len(rres['not_found'])}" if rres["not_found"] else ""))
+        _drop_pushed(trakt_id, remove)
+
+    after = trakt_watched_episodes(trakt_id, refresh=True)
+    after_cmp = {p for p in after if p[0] != 0 or args.include_specials}
+    ok = after_cmp == target
+    journal["status"] = "done" if ok else "done: mismatch"
+    journal.save()
+    print(f"  kontrola: Trakt teď má {len(after_cmp)}, cíl {len(target)} → "
+          f"{'sedí' if ok else 'NESEDÍ: ' + str(sorted(after_cmp ^ target)[:10])}")
+
+
+def _drop_pushed(imdb: str, pairs) -> None:
+    """Co `exact` z Traktu odebral, nesmí `redate` později vrátit."""
+    pushed = common.read_json(PUSHED, None)
+    if not pushed:
+        return
+    drop = {(imdb, int(s), int(e)) for s, e in pairs}
+    pushed["episodes"] = [x for x in pushed.get("episodes") or [] if tuple(x) not in drop]
+    common.atomic_write_json(PUSHED, pushed)
 
 
 def main() -> None:
@@ -732,6 +863,8 @@ def main() -> None:
     pu = sub.add_parser("push", help="doplnit chybějící do Traktu")
     pu.add_argument("--yes", action="store_true", help="skutečně zapsat")
     pu.add_argument("--include-specials", action="store_true", help="zapsat i speciály (S0)")
+    pu.add_argument("--force-repeat", action="store_true",
+                    help="zapsat i to, co se zapsalo v posledních dnech")
     pu.set_defaults(func=cmd_push)
     rd = sub.add_parser("redate", help="doplní datum u dřív zapsaných epizod")
     rd.add_argument("--yes", action="store_true", help="skutečně přepsat")
@@ -743,12 +876,19 @@ def main() -> None:
     fw.add_argument("--only", help="jen jeden titul (IMDb ID)")
     fw.add_argument("--date", help="datum zápisu, nebo 'unknown'")
     fw.add_argument("--max", type=int, help="zapsat jen seriály s tolika nejvýše chybějícími díly")
+    fw.add_argument("--include-specials", action="store_true", help="doplnit i speciály (S0)")
+    fw.add_argument("--force-repeat", action="store_true",
+                    help="zapsat i to, co se zapsalo v posledních dnech")
     fw.set_defaults(func=cmd_forward)
     ex = sub.add_parser("exact", help="srovná Trakt přesně na zhlédnuté díly podle Stremia")
     ex.add_argument("--only", required=True, help="titul (IMDb ID ze Stremia nebo Traktu)")
     ex.add_argument("--yes", action="store_true", help="skutečně zapsat (i mazat)")
     ex.add_argument("--date", help="datum pro doplněné díly (výchozí: unknown)")
     ex.add_argument("--include-specials", action="store_true", help="počítat i speciály (S0)")
+    ex.add_argument("--allow-unmatched", action="store_true",
+                    help="pokračovat, i když se některé díly nenamapovaly")
+    ex.add_argument("--force-repeat", action="store_true",
+                    help="zapsat i to, co se zapsalo v posledních dnech")
     ex.set_defaults(func=cmd_exact)
     args = ap.parse_args()
     args.func(args)
