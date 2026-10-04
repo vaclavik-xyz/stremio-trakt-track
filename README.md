@@ -1,184 +1,189 @@
 # stremio-trakt-track
 
-Doplní Traktu, co se ve Stremiu zhlédlo, a vede lokální historii sledování v SQLite
-(filmy, epizody, hodnocení, watchlist, postup u seriálů) včetně přehledů po měsících,
-letech a „kolik času u toho" (`track.py watchtime`). Bez závislostí, jen stdlib Pythonu 3.
+A one-way bridge from **Stremio to Trakt** plus a **local archive** of your Trakt
+history in SQLite, with monthly/yearly/lifetime reports. Python 3 standard library
+only — nothing to `pip install`.
 
-Vzniklo proto, že propojení Traktu přímo ve Stremiu se rozpadá (`stremio-bugs` #1436)
-a historie se pak ztrácí. Most si stav Stremia přečte sám (jeho knihovnu a bitovou
-mapu zhlédnutých dílů) a co v Traktu chybí, doplní — a umí i odebrat, co Stremio jako
-zhlédnuté nevede.
+Why: Stremio's built-in Trakt integration keeps disconnecting
+([Stremio/stremio-bugs#1436](https://github.com/Stremio/stremio-bugs/issues/1436)),
+and every disconnect silently loses watch history. Stremio's own library sync is
+reliable, so the bridge reads what you watched from Stremio and fills in what Trakt
+is missing.
 
-Není to oficiální nástroj Stremia ani Traktu, obojí jsou cizí služby, ke kterým se
-skript připojuje přes jejich API. Licence: MIT (`LICENSE`).
+This is a personal tool published as "works for me". It is not affiliated with
+Stremio or Trakt. Licence: MIT (`LICENSE`). CLI output and reports are in Czech.
 
-## Jednorázové nastavení
+> **Stremio's API is unofficial and undocumented.** The bridge only *reads* from it
+> (`api.strem.io` login, `datastoreGet`) and never writes to your Stremio account.
+> It may break whenever Stremio changes it.
 
-1. **Založit API aplikaci na Traktu:** https://trakt.tv/oauth/applications/new
-   - Name: `stremio-trakt-track`
-   - Redirect URI: `urn:ietf:wg:oauth:2.0:oob` — portál u něj ukáže žluté varování
-     "Insecure redirect URIs". Je to jen varování; pokud aplikaci uloží, nech to tak.
-     Kdyby uložení bloklo, použij jakoukoli HTTPS adresu, kterou vlastníš (URL se nikdy
-     reálně nenavštěvuje, protože používáme device flow) a stejnou hodnotu zadej
-     do setup skriptu.
-   - Po uložení zkopíruj **Client ID** a **Client Secret**.
-2. **Uložit údaje** (interaktivně, práva 600, hodnoty nejdou do historie shellu):
+## Requirements
+
+- Python ≥ 3.9 (uses `str.removeprefix`)
+- SQLite ≥ 3.30 (`FILTER` clause; bundled with any recent Python)
+- macOS or Linux (`strftime("%-d")` and `fcntl` are not available on Windows)
+- A Trakt account and your own Trakt API application
+
+## Setup
+
+1. **Create a Trakt API app:** <https://trakt.tv/oauth/applications/new>.
+   Any name; redirect URI `urn:ietf:wg:oauth:2.0:oob` (the portal warns that it is
+   insecure — it is never visited, the tool uses the device flow). Copy the
+   **Client ID** and **Client Secret**.
+2. **Store the credentials** (interactive, file mode 600, never on the command line):
    ```bash
-   bash ~/Documents/trakt-tracker/setup_secret.sh
+   bash setup_secret.sh
    ```
-3. **Přihlásit se device flow:**
+3. **Log in to Trakt** (device flow — you type the code on trakt.tv):
    ```bash
-   python3 ~/Documents/trakt-tracker/track.py auth
+   python3 track.py auth
    ```
-   Vypíše kód a URL `https://trakt.tv/activate`; kód se zadává na webu Traktu, ne do chatu.
+4. **Log in to Stremio** (only the `authKey` is stored, never the password):
+   ```bash
+   bash setup_stremio.sh
+   ```
+5. Optional: `cp alias.example.json alias.json` for titles that Trakt files under a
+   different IMDb ID than Stremio.
 
-## Běžné použití
+All personal files (`config.json`, `stremio.json`, `tracker.db`, caches, journals,
+`alias.json`) live next to the code and are git-ignored. Set `TRAKT_TRACKER_HOME`
+to keep them elsewhere.
+
+## Usage
+
+### Local archive and reports (read-only towards Trakt)
+
 ```bash
-python3 track.py sync              # stáhne vše z Traktu do tracker.db (idempotentní)
-python3 track.py report            # přehled za aktuální měsíc
+python3 track.py sync                  # mirror Trakt history into tracker.db
+python3 track.py report                # this month
 python3 track.py report --month 2026-09
-python3 track.py report --year     # celý letošní rok
-python3 track.py report --all      # celoživotní přehled (spočítaný z historie)
-python3 track.py watchtime         # kolik času u sledování + odhad za život
-python3 track.py status            # kolik je v DB záznamů + kdy proběhl sync
+python3 track.py report --year         # this year
+python3 track.py report --all          # lifetime, computed from history
+python3 track.py watchtime             # time spent watching + a lifetime estimate
+python3 track.py status                # row counts, last sync
 ```
 
-## Soubory
+`sync` is a mirror, not a pile: entries deleted on Trakt are marked `deleted_at` and
+drop out of the reports, but stay in the database. If a single sync would mark more
+than 50 rows *and* more than 5 % of a table, it refuses (exit code 4) — that looks
+like a Trakt outage, not a cleanup. Run `sync --allow-mass-delete` if it was intended.
 
-- `config.json` (600) – client_id, client_secret, access/refresh token. **Nikdy necommitovat.**
-- `tracker.db` – SQLite: `watched_movies`, `watched_episodes`, `ratings`, `watchlist`,
-  `shows_progress`, `meta` (username, stats, synced_at).
-- `track.py` – CLI (`auth`, `sync`, `report`, `status`).
-- `setup_secret.sh` – uložení API údajů.
-
-## Poznámky k API
-
-- Base URL `https://api.trakt.tv`, hlavičky `trakt-api-key`, `trakt-api-version: 2`, `User-Agent`.
-- Limity: GET 1000 / 5 min, zápisy 1 / s. Kód řeší 429 přes `Retry-After`.
-- Použité endpointy: `/oauth/device/code`, `/oauth/device/token`, `/oauth/token`,
-  `/users/me`, `/users/me/stats`, `/users/me/watched/shows`, `/sync/history/{movies,episodes}`,
-  `/sync/ratings/{movies,shows,seasons,episodes}`, `/sync/watchlist/{movies,shows}`,
-  `/shows/{id}/progress/watched`.
-- `sync` je read-only vůči Traktu – nic nezapisuje ani nemění.
-- **`/users/me/stats` umí vrátit `null`** (Trakt statistiku nedá), takže
-  celoživotní čísla se počítají z `tracker.db`: počty záznamů, unikátní tituly, hodiny
-  z `runtime` jednotlivých záznamů, dny (`DISTINCT substr(watched_at,1,10)`) a roky.
-- Historie začíná **6. 4. 2025** — starší sledování nikde není, Trakt ho nezná a Stremio
-  si ho taky nepamatuje. Celoživotní přehled je tedy „od začátku účtu".
-
-## Obnova tokenu
-
-Access token platí ~90 dní. Když je v `config.json` i `client_secret`, `track.py` si token
-obnoví sám. Bez secretu (když se přeskočil) je po vypršení potřeba spustit `auth` znovu.
-
-## Most Stremio → Trakt
-
-Stremio má dlouhodobou chybu: jeho zabudované Trakt propojení odpadá po hodinách až dnech
-(GitHub Stremio/stremio-bugs#1436). Knihovna Stremia se ale synchronizuje spolehlivě přes
-vlastní cloud, takže most čte zhlédnuté odtud a doplňuje, co v Traktu chybí.
+### Bridge (writes to Trakt — dry-run unless `--yes`)
 
 ```bash
-bash setup_stremio.sh                    # jednorázově: přihlášení (uloží se jen authKey, 600)
-python3 stremio_bridge.py fetch          # stáhne knihovnu → stremio_library.json
-python3 stremio_bridge.py list           # co je ve knihovně a co je zhlédnuté
-python3 stremio_bridge.py compare        # co má Stremio zhlédnuté a Trakt ne → gaps.json
-python3 stremio_bridge.py push           # zápis chybějícího do Traktu (dry-run)
-python3 stremio_bridge.py push --yes     # skutečný zápis
-python3 stremio_bridge.py forward        # pro seriály s nečitelnou bitovou mapou (dry-run)
-python3 stremio_bridge.py forward --yes  # doplní mezeru k poslednímu dokoukanému dílu
-python3 stremio_bridge.py exact --only <imdb>        # srovná Trakt přesně na Stremiův seznam (dry-run)
-python3 stremio_bridge.py exact --only <imdb> --yes  # i s odebráním dílů, které Stremio nevede
+python3 stremio_bridge.py fetch              # download the Stremio library
+python3 stremio_bridge.py list               # what Stremio has watched
+python3 stremio_bridge.py compare            # Stremio vs live Trakt → gaps.json
+python3 stremio_bridge.py push [--yes]       # add what Trakt is missing
+python3 stremio_bridge.py forward [--yes]    # fill gaps for shows compare could not verify
+python3 stremio_bridge.py exact --only <imdb> [--yes]   # make one show on Trakt match Stremio exactly
+python3 stremio_bridge.py redate [--yes]     # give a date to episodes written as "unknown"
 ```
 
-Jak to funguje:
-- Stremio drží u seriálu bitovou mapu zhlédnutých epizod (`state.watched`, zlib+base64).
-  Pole `<season>:<episode>` v ní je poslední **dokoukaný** díl (v mapě ještě není), zatímco
-  `state.video_id` je poslední **přehrávaný** díl — ten může být rozehraný.
-  Indexy se mapují na pořadí videí z Cinemeta (`cinemeta_cache.json`), které odpovídá
-  řazení ve Stremiu (speciály S0 první, pak S1, S2…).
-- U filmů se bere `timesWatched`/`flaggedWatched`/`lastWatched`.
-- `push` posílá jen to, co v Traktu chybí (Trakt duplicity nehlídá), a zapisuje si, co už
-  odeslal, do `pushed.json`.
-- Přesné datum zhlédnutí zná Stremio jen u posledního dílu seriálu; starší epizody se
-  zapisují jako `watched_at: "unknown"` — radši bez data než s vymyšleným. Trakt si je
-  uloží s datem 1. 1. 1970, takže se nepočítají do statistik (`pochopeno` bolem).
-- `python3 stremio_bridge.py redate --yes` tyhle epizody přepíše na den posledního dílu
-  daného seriálu (smazat + zapsat znovu), aby statistiky seděly. Datum je odhad.
-- `alias.json` řeší tituly, které má Trakt pod jiným IMDb ID než Stremio
-  (např. seriál, který má v Traktu jiné IMDb ID než ve Stremiu).
+Common flags: `--yes` (actually write), `--only <imdb>`, `--include-specials`,
+`--json` (on `compare` and `forward`), `--force-repeat` (see below).
 
-### Automatizace (cron)
+Exit codes: `0` ok, `1` error, `2` refused (e.g. unsafe `exact`), `3` another run
+holds the lock, `4` sync prune guard, `10` finished with warnings (unverified
+titles, rejected writes).
 
-Denní a týdenní běh řeší dva skripty bez agenta (žádné LLM, jen deterministická práce):
+## How it works
 
-- `cron_daily.py` — stáhne knihovnu Stremia, porovná s Traktem, zapíše chybějící filmy
-  a epizody (`push`), doplní mezery k poslednímu dokoukanému dílu (`forward --max 8`)
-  a zaktualizuje `tracker.db`. **Ticho znamená dobře** — vypíše se jen to, co se zapsalo,
-  co potřebuje rozhodnutí (mezera nad 8 dílů), nebo co selhalo, takže prázdný výstup
-  se nikam neposílá.
-- `cron_weekly.py` — rekapitulace posledních sedmi dní z `tracker.db` (filmy, seriály,
-  hodiny, kde jsme skončili) + souhrn za letošní rok.
+- Stremio keeps a per-show bitfield of watched episodes (`state.watched`,
+  `<anchor video id>:<anchor length>:<base64(zlib(bits))>`, LSB-first). The anchor is
+  the last watched video. Bits are mapped onto Cinemeta's video list and, like
+  Stremio itself, re-anchored when that list changed since the bitfield was saved.
+- A movie counts as watched when Stremio counted a play (`timesWatched`) or it was
+  marked as watched — merely opening it is not enough.
+- What Trakt already has is always read **live** (`/sync/watched/shows`,
+  `/sync/watched/movies`). If any read fails, the command aborts — it never
+  proceeds with an empty set, because "Trakt has nothing" would mean writing
+  everything again.
+- Only the last watched episode has a real date in Stremio; older ones are written
+  as `watched_at: unknown` (Trakt stores them as 1970-01-01 and leaves them out of
+  statistics). `redate` can replace them with the date of the last episode.
+- Cinemeta and Trakt sometimes number hour-long double episodes differently
+  ("Title (1)"/"(2)" vs one episode). `exact` aligns whole seasons by title (by
+  episode number when counts and numbers agree).
 
-Proč `--max 8`: když scrobblování vypadne na týden, mezera je pár dílů a automatika ji
-doplní. Když je mezera velká (řádově desítky dílů), nejde o výpadek scrobblování, ale
-o starší sledování — to se jen ohlásí a čeká na rozhodnutí, protože by to zkreslilo
-statistiky i historii.
+## Write safety
 
-Ruční spuštění kdykoli:
+Trakt counts **every write as another play** and never deduplicates. The bridge
+therefore:
+
+- writes nothing without `--yes`, and lets only one writing run at a time (`.lock`);
+- sends all writes through one module (`writes.py`) that appends every add and
+  removal to `write_log.jsonl`, and **refuses to add the same item again within
+  7 days** (reported as an anomaly — usually Trakt accepted the write but does not
+  show it, e.g. a merged IMDb ID). `--force-repeat` overrides it;
+- keeps per-run journals (`last_push.json`, `last_forward.json`, `last_exact.json`,
+  `last_redate.json`) that are saved after every request.
+
+`exact` and `redate` **remove** history. Both add first and remove second, remove
+exact history entries by ID, and save the removed entries (with their original
+`watched_at`) before deleting. `exact` refuses to run when an episode cannot be
+paired or the target would be empty. Always look at the dry-run first.
+
+## Automation
+
+`cron_daily.py` runs fetch → compare → push → `forward --max 8` → `track.py sync`
+and prints only what was written, what needs a decision, or what failed (silence
+means all good). `cron_weekly.py` prints a weekly recap. `backup_db.py` makes a
+consistent `VACUUM INTO` snapshot of `tracker.db` (to iCloud Drive by default; see
+`--to`, `TRAKT_BACKUP_DIR` or `settings.backup_dir`), keeps 30 days plus the latest
+snapshot of each of the last 12 months, and verifies each snapshot.
+
+Example crontab (mail the output, which is empty when nothing happened):
+
+```cron
+MAILTO=you@example.com
+30 23 * * *  /usr/bin/python3 /path/to/stremio-trakt-track/cron_daily.py
+45 23 * * *  /usr/bin/python3 /path/to/stremio-trakt-track/backup_db.py --quiet
+0  20 * * 0  /usr/bin/python3 /path/to/stremio-trakt-track/cron_weekly.py
+```
+
+On macOS you can use a LaunchAgent instead — see `docs/launchd.example.plist`.
+
+## Settings
+
+Optional `"settings"` block in `config.json` (defaults shown):
+
+```json
+"settings": {
+  "cache_ttl_hours": 24, "match_threshold": 0.6, "repeat_guard_days": 7,
+  "max_auto": 8, "issue_remind_days": 7,
+  "prune_max_rows": 50, "prune_max_fraction": 0.05, "backup_dir": null
+}
+```
+
+## Known limitations
+
+- Specials (season 0) are skipped unless `--include-specials`.
+- Only the last episode of a show gets a real watch date.
+- Shows whose bitfield cannot be verified are handled by `forward`, which fills the
+  gap up to the last watched episode (including episodes you may have skipped).
+- Rewatches are not detected; a title already on Trakt is not written again.
+- Trakt access tokens expire after about a week; with a client secret the tool
+  refreshes them automatically, otherwise run `track.py auth` again.
+
+## Tests
+
 ```bash
-python3 ~/Documents/trakt-tracker/cron_daily.py    # denní doplnění
-python3 ~/Documents/trakt-tracker/cron_weekly.py   # týdenní přehled
+python3 -m unittest discover -s tests
 ```
 
-## Záloha
+The suite needs no network and never touches your data: it points
+`TRAKT_TRACKER_HOME` at a temporary directory and fakes the Trakt API.
 
-`tracker.db` je lokální a do iCloudu se **nepřesouvá** — synchronizace na úrovni
-souborů umí databázi rozbít (dva zápisy proti sobě, zámky, konfliktní kopie).
-Místo toho se z ní dělá konzistentní snapshot a do iCloudu jde ten:
+## Uninstall
 
-```sh
-python3 backup_db.py            # snapshot + úklid starých
-python3 backup_db.py --list     # co je v záloze
-```
+1. Revoke the app on <https://trakt.tv/oauth/authorized_applications> and delete it
+   under your API applications.
+2. Delete `config.json` and `stremio.json`. The Stremio `authKey` stays valid until
+   you log out of Stremio on all devices.
+3. Remove cron jobs / LaunchAgents and, if you want, the backup folder.
 
-Snapshoty jdou do `~/Library/Mobile Documents/com~apple~CloudDocs/trakt-tracker-backups/`
-(jde přenastavit přes `--to` nebo `TRAKT_BACKUP_DIR`), drží se všechny za posledních
-30 dní plus nejnovější z každého měsíce. Kopie se po vytvoření kontroluje: musí projít
-`PRAGMA integrity_check` a mít stejné počty záznamů jako živá databáze, jinak se zahodí.
-Zálohuje se i `alias.json` (ruční opravy ID). Přihlašovací údaje se záměrně **ne**zálohují,
-ty se dají znovu vytvořit setup skripty.
+## Notes
 
-Bonus: snapshots jsou zároveň body návratu — když se z Traktu omylem smaže historie,
-dá se záloha otevřít a zjistit, co tam bylo.
-
-Co se zapsalo, si most zapisuje do `last_push.json` / `last_forward.json`; denní skript
-z nich skládá zprávu. Porovnávat `pushed.json` před/po nestačí — když se záznam v Traktu
-ztratí a doplní se znovu, v `pushed.json` už je a rozdíl vyjde prázdný.
-
-## Na co pozor
-- **`exact` = zrcadlo jednoho seriálu.** `push` jen doplňuje a `forward` doplní mezeru
-  k poslednímu dokoukanému dílu — oba nechají v Traktu i díly, které uživatel přeskočil.
-  `exact --only <imdb>` udělá z Traktu přesně to, co hlásí Stremio: doplní, co chybí,
-  a odebere, co Stremio jako zhlédnuté nevede. Vždy nejdřív dry-run a pak zkontroluj
-  `kontrola:` na konci — musí sedět počet i množina.
-- **Cinemeta a Trakt číslují hodinové díly jinak.** Cinemeta je vede jako dva záznamy
-  („Fun Run (1)“ / „(2)“), Trakt obvykle jako jeden — ale ne vždy: u některých seriálů je vede Trakt taky rozdělené. Proto se páry mapují podle názvů (přesná shoda včetně
-  značky `(1)/(2)`, pak shoda bez značky) v rámci jedné řady a v pořadí; bez toho se
-  oba půldíly slepí do jednoho dílu a jeden pak zbytečně zmizí (`map_cinemeta_pairs`).
-- **`track.py sync` je zrcadlo, ne hromada.** Když se v Traktu něco smaže (ručně, přes
-  `redate` nebo opravou), musí to zmizet i z `tracker.db` — jinak přehledy počítají mrtvé
-  záznamy. Po opravách, které epizody přepisovaly, se takhle našlo 56 mrtvých epizod;
-  přehled 2026 hlásil 252 epizod místo 245.
-- **O tom, co chybí, rozhoduje živý stav Traktu, ne `pushed.json`.** Ten slouží jen pro
-  `redate`; kdyby blokoval zápis, smazaný záznam by se už nikdy nedoplnil.
-- **Mapování epizod není samozřejmost.** Bitová mapa Stremia je pořadí videí, jak je viděl
-  Stremio; Cinemeta je dnes může řadit jinak. Každý seriál se proto ověřuje dvakrát:
-  (1) nejvyšší zhlédnutý index musí odpovídat poli `season`/`episode`, které u sebe Stremio
-  uvádí, (2) všechny namapované díly musí existovat v Traktu. Co neprojde, se **nezapisuje**
-  a hlásí se zvlášť — jinak by do Traktu šly nesmysly typu `S0E110`.
-- U části seriálů ověření neprochází a zůstávají ručně.
-- Trakt historii **nededuplikuje** — každý zápis znamená další zhlédnutí. Proto se zapisuje
-  jen to, co v Traktu chybí, a `pushed.json` drží přehled, co už bylo odesláno.
-- Porovnání čte zhlédnuté filmy živě z Traktu, ne z lokální DB (ta je starší a hlásila by
-  falešné rozdíly).
-
+Operational history and the reasoning behind the design decisions (in Czech):
+`docs/notes.md`.

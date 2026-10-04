@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Example LaunchAgent for the nightly bridge run on macOS.
+  1. Replace /path/to/stremio-trakt-track and the label.
+  2. Copy to ~/Library/LaunchAgents/com.example.stremio-trakt.daily.plist
+  3. launchctl load ~/Library/LaunchAgents/com.example.stremio-trakt.daily.plist
+  Output goes to the log files below; cron_daily.py prints nothing when all is well,
+  so a non-empty log means something to look at.
+  Make copies for cron_weekly.py and backup_db.py (with "quiet" argument) as needed.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.stremio-trakt.daily</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/path/to/stremio-trakt-track/cron_daily.py</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>23</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/tmp/stremio-trakt-daily.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/stremio-trakt-daily.err</string>
+</dict>
+</plist>

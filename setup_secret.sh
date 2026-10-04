@@ -1,10 +1,12 @@
 #!/bin/bash
 # Uloží Trakt API přihlašovací údaje do config.json (práva 600).
-# Hodnoty se neukládají do historie shellu a nikam se neposílají.
+# Hodnoty se neukládají do historie shellu, nejdou na příkazovou řádku (ps je
+# neukáže) a nikam se neposílají — do Pythonu tečou přes stdin.
 set -euo pipefail
+umask 077
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CFG="$DIR/config.json"
+CFG="${TRAKT_TRACKER_HOME:-$DIR}/config.json"
 
 if [ -f "$CFG" ]; then
   read -r -p "config.json už existuje, přepsat? [y/N] " ans
@@ -16,18 +18,28 @@ read -r -s -p "Client Secret (Enter = přeskočit):  " CSEC
 echo
 read -r -p "Redirect URI (Enter = urn:ietf:wg:oauth:2.0:oob):  " RURI
 
-python3 - "$CFG" "$CID" "$CSEC" "$RURI" <<'PY'
-import json, os, pathlib, stat, sys
-cfg_path, cid, csec, ruri = sys.argv[1], sys.argv[2].strip(), sys.argv[3].strip(), sys.argv[4].strip()
-data = {"client_id": cid,
-        "redirect_uri": ruri or "urn:ietf:wg:oauth:2.0:oob"}
+# printf je vestavěný příkaz bashe → hodnoty se neobjeví v seznamu procesů
+printf '%s\n%s\n%s\n' "$CID" "$CSEC" "$RURI" | python3 -c '
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import common
+cid, csec, ruri = (sys.stdin.readline().strip() for _ in range(3))
+path = common.DATA_DIR / "config.json"
+old = {}
+if path.exists():
+    try:
+        old = json.loads(path.read_text())
+    except ValueError:
+        old = {}
+data = {"client_id": cid, "redirect_uri": ruri or "urn:ietf:wg:oauth:2.0:oob"}
 if csec:
     data["client_secret"] = csec
-p = pathlib.Path(cfg_path)
-p.write_text(json.dumps(data, indent=2) + "\n")
-os.chmod(p, stat.S_IRUSR | stat.S_IWUSR)
-print(f"Uloženo do {p} (práva 600).")
-PY
+if old.get("settings"):
+    data["settings"] = old["settings"]      # vlastní nastavení přepsání přežije
+common.atomic_write_json(path, data, indent=2)
+print(f"Uloženo do {path} (práva 600).")
+' "$DIR"
+unset CSEC
 
 echo
 echo "Pokračuj:  python3 \"$DIR/track.py\" auth"
