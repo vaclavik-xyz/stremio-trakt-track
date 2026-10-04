@@ -89,6 +89,16 @@ class State(unittest.TestCase):
         self.assertEqual(calls, [False, True])
         self.assertEqual(st["watched"], {(1, 3)})
 
+    def test_bits_beyond_anchor_are_not_counted(self):
+        # seen in live data: anchor says 2 videos, but bit 3 is set too
+        item = {"_id": SID, "type": "series", "name": "Show",
+                "state": {"watched": bitfield(4, [0, 1, 3], f"{SID}:1:2", anchor_length=2)}}
+        videos = vids([(1, 1), (1, 2), (1, 3), (1, 4)])
+        with mock.patch.object(b, "cinemeta_videos", lambda sid, refresh=False: videos):
+            st = b.stremio_state(item)
+        self.assertEqual(st["watched"], {(1, 1), (1, 2)})
+        self.assertEqual(st["beyond_anchor"], [(1, 4)])
+
     def test_anchor_unknown_is_unverified(self):
         with mock.patch.object(b, "cinemeta_videos", lambda sid, refresh=False: vids([(1, 1)])):
             st = b.stremio_state(self.series(3, [2], 3))

@@ -29,18 +29,19 @@ def seasons(titles):
                                        for e, t in enumerate(titles, 1)]}]
 
 
-def watched_shows(pairs):
-    eps = {}
+def progress(pairs):
+    """/shows/{id}/progress/watched answer with the given episodes completed."""
+    seasons = {}
     for s, e in pairs:
-        eps.setdefault(s, []).append({"number": e})
-    return [{"show": {"ids": {"imdb": SID, "trakt": 1}},
-             "seasons": [{"number": s, "episodes": v} for s, v in eps.items()]}]
+        seasons.setdefault(s, []).append({"number": e, "completed": True})
+    return {"aired": 10, "completed": len(pairs),
+            "seasons": [{"number": s, "episodes": v} for s, v in sorted(seasons.items())]}
 
 
 class Base(unittest.TestCase):
     def setUp(self):
         helpers.clean_home()
-        b._WATCHED_SHOWS = None
+        b._WATCHED.clear()
         for target, attr, val in ((writes, "WRITE_SLEEP", 0),):
             p = mock.patch.object(target, attr, val)
             p.start()
@@ -63,9 +64,9 @@ class CompareAndPush(Base):
 
     def test_failed_episode_read_aborts_compare(self):
         fake = self.setup(library(3, [0, 1, 2], 3), self.TITLES, {
-            ("GET", "/sync/watched/movies"): [],
+            ("GET", "/sync/history/movies"): [],
             ("GET", f"/shows/{SID}/seasons"): seasons(self.TITLES),
-            ("GET", "/sync/watched/shows"): network_error(),
+            ("GET", f"/shows/{SID}/progress/watched"): network_error(),
         })
         with self.assertRaises(track.TraktError):
             b.cmd_compare(argparse.Namespace())
@@ -73,14 +74,14 @@ class CompareAndPush(Base):
         self.assertEqual(fake.posts(), [])
 
     def test_failed_movie_read_has_no_db_fallback(self):
-        self.setup([], [], {("GET", "/sync/watched/movies"): network_error()})
+        self.setup([], [], {("GET", "/sync/history/movies"): network_error()})
         with self.assertRaises(track.TraktError):
             b.compute_gaps()
         self.assertFalse((helpers.TMP_HOME / "tracker.db").exists())
 
     def test_failed_inventory_read_aborts_compare(self):
         self.setup(library(3, [0, 1, 2], 3), self.TITLES, {
-            ("GET", "/sync/watched/movies"): [],
+            ("GET", "/sync/history/movies"): [],
             ("GET", f"/shows/{SID}/seasons"): network_error(),
         })
         with self.assertRaises(track.TraktError):
@@ -89,9 +90,9 @@ class CompareAndPush(Base):
     def test_push_twice_when_trakt_does_not_show_it(self):
         """H2: Trakt accepts the write but the read endpoint keeps missing it."""
         fake = self.setup(library(3, [0, 1, 2], 3), self.TITLES, {
-            ("GET", "/sync/watched/movies"): [],
+            ("GET", "/sync/history/movies"): [],
             ("GET", f"/shows/{SID}/seasons"): seasons(self.TITLES),
-            ("GET", "/sync/watched/shows"): watched_shows([(1, 1)]),
+            ("GET", f"/shows/{SID}/progress/watched"): progress([(1, 1)]),
             ("POST", "/sync/history"): history_ok,
         })
         args = argparse.Namespace(yes=True, include_specials=False, force_repeat=False)
@@ -101,12 +102,46 @@ class CompareAndPush(Base):
         journal = json.loads(b.LAST_PUSH.read_text())
         self.assertEqual(journal["shows"][0]["pairs"], [[1, 2], [1, 3]])
 
-        b._WATCHED_SHOWS = None
+        b._WATCHED.clear()
         b.cmd_compare(argparse.Namespace())
         b.cmd_push(args)
         self.assertEqual(len(fake.posts()), 1, "second night must not write again")
         journal = json.loads(b.LAST_PUSH.read_text())
         self.assertEqual(len(journal["repeat"]), 2)
+
+
+class ShapeGuard(Base):
+    """A valid-looking answer without the data we need must fail, not mean "nothing"."""
+    TITLES = ["Pilot", "Arrival", "Heist"]
+
+    def test_progress_without_seasons_aborts(self):
+        # takhle vypadal skutečný problém: souhrn bez epizod (plays/completed, žádné seasons)
+        fake = self.setup(library(3, [0, 1, 2], 3), self.TITLES, {
+            ("GET", "/sync/history/movies"): [],
+            ("GET", f"/shows/{SID}/seasons"): seasons(self.TITLES),
+            ("GET", f"/shows/{SID}/progress/watched"): {"aired": 3, "completed": 3,
+                                                        "last_watched_at": "2026-01-01T00:00:00.000Z"},
+        })
+        with self.assertRaises(track.TraktError):
+            b.cmd_compare(argparse.Namespace())
+        self.assertFalse(b.GAPS.exists())
+        self.assertEqual(fake.posts(), [])
+
+    def test_progress_with_nothing_watched_is_fine(self):
+        self.setup([], [], {})
+        with mock.patch.object(track, "_req", FakeTrakt({
+                ("GET", f"/shows/{SID}/progress/watched"): {"aired": 3, "completed": 0, "seasons": []}})):
+            self.assertEqual(b.trakt_watched_episodes(SID), set())
+
+    def test_movie_history_without_ids_aborts(self):
+        self.setup([], [], {("GET", "/sync/history/movies"): [{"id": 1, "movie": {"title": "X"}}]})
+        with self.assertRaises(track.TraktError):
+            b.compute_gaps()
+
+    def test_seasons_without_episodes_abort(self):
+        self.setup([], [], {("GET", f"/shows/{SID}/seasons"): [{"number": 1}, {"number": 2}]})
+        with self.assertRaises(track.TraktError):
+            b.trakt_seasons(SID)
 
 
 class Exact(Base):
@@ -127,7 +162,7 @@ class Exact(Base):
     def test_unmatched_refuses(self):
         fake = self.setup(library(4, [0, 3], 4), ["Pilot", "Arrival", "Heist", "Bonus"], {
             ("GET", f"/shows/{SID}/seasons"): seasons(["Pilot", "Arrival", "Heist"]),
-            ("GET", "/sync/watched/shows"): watched_shows([(1, 1), (1, 2), (1, 3)]),
+            ("GET", f"/shows/{SID}/progress/watched"): progress([(1, 1), (1, 2), (1, 3)]),
         })
         with self.assertRaises(SystemExit) as cm:
             b.cmd_exact(self.args())
@@ -150,7 +185,7 @@ class Exact(Base):
 
         fake = self.setup(library(3, [0, 2], 3), titles, {
             ("GET", f"/shows/{SID}/seasons"): seasons(titles),
-            ("GET", "/sync/watched/shows"): lambda body, params: watched_shows(state["pairs"]),
+            ("GET", f"/shows/{SID}/progress/watched"): lambda body, params: progress(state["pairs"]),
             ("GET", f"/sync/history/shows/{SID}"): [
                 {"id": 501, "type": "episode", "watched_at": "2026-01-01T20:00:00.000Z",
                  "episode": {"season": 1, "number": 1}, "show": {"title": "Show", "ids": {"imdb": SID}}},

@@ -220,11 +220,16 @@ def stremio_state(item: dict) -> dict:
             wb = decode_watched(w)
             out["marker"] = (wb["season"], wb["episode"])
             stremio_id = item.get("_id") or wb["sid"]
+            # Bity za kotvou (index >= anchor_length) by podle formátu neměly existovat,
+            # ale v živých datech se objevují (i zjevně nesmyslné: kotva S0E1, bit 199).
+            # Za zhlédnuté se nepočítají; jen se hlásí v `beyond_anchor`.
+            inside = [k for k in wb["bits"] if k < wb["n"]]
+            beyond = [k for k in wb["bits"] if k >= wb["n"]]
             videos = cinemeta_videos(stremio_id)
-            idx = realign(wb["bits"], wb["n"], wb["anchor"], [v[0] for v in videos])
+            idx = realign(inside, wb["n"], wb["anchor"], [v[0] for v in videos])
             if idx is None:     # seznam v cache může být starý
                 videos = cinemeta_videos(stremio_id, refresh=True)
-                idx = realign(wb["bits"], wb["n"], wb["anchor"], [v[0] for v in videos])
+                idx = realign(inside, wb["n"], wb["anchor"], [v[0] for v in videos])
             if idx is None:
                 out["verified"] = False
                 out["error"] = f"poslední dokoukaný díl {wb['anchor']} v Cinemetě není"
@@ -236,6 +241,12 @@ def stremio_state(item: dict) -> dict:
                     _vid, s, e, _t = videos[i]
                     if s is not None and e is not None:
                         out["watched"].add((int(s), int(e)))
+                if beyond:
+                    extra = realign(beyond, wb["n"], wb["anchor"], [v[0] for v in videos]) or []
+                    out["beyond_anchor"] = sorted({(int(videos[i][1]), int(videos[i][2]))
+                                                   for i in extra
+                                                   if videos[i][1] is not None
+                                                   and videos[i][2] is not None})
         vid = state.get("video_id")
         if vid and ":" in vid:
             parts = vid.split(":")
@@ -257,45 +268,64 @@ def stremio_state(item: dict) -> dict:
 # „Trakt opravdu nic nemá“, nikdy „nepovedlo se to přečíst“.
 
 
-_WATCHED_SHOWS: dict | None = None
+_WATCHED: dict[str, set] = {}
 
 
-def trakt_watched_shows(refresh: bool = False) -> dict[str, set]:
-    """Všechny zhlédnuté díly všech seriálů jedním voláním `/sync/watched/shows`.
+def _shape_error(what: str) -> Exception:
+    import track
+    return track.TraktError(f"{what} — odpověď Traktu nemá očekávaný tvar, nezapisuju nic")
 
-    Klíč je IMDb ID a `trakt:<id>`. Na rozdíl od `/shows/{id}/progress/watched` sem
-    patří i skryté řady — jinak by se díly z nich doplňovaly každou noc znovu.
+
+def parse_progress(imdb: str, pr) -> set[tuple[int, int]]:
+    """Zhlédnuté díly z `/shows/{id}/progress/watched`.
+
+    Pojistka proti tiché ztrátě: když Trakt hlásí `completed > 0`, ale v odpovědi
+    nejde najít ani jeden zhlédnutý díl (chybí `seasons`, jiný tvar), je to chyba —
+    prázdná množina by znamenala zapsat celý seriál znovu.
     """
-    global _WATCHED_SHOWS
-    if _WATCHED_SHOWS is None or refresh:
-        import track
-        rows = track._req("GET", "/sync/watched/shows")[0]
-        if not isinstance(rows, list):
-            raise track.TraktError("/sync/watched/shows nevrátil seznam")
-        out: dict[str, set] = {}
-        for r in rows:
-            ids = (r.get("show") or {}).get("ids") or {}
-            eps = {(int(s["number"]), int(e["number"]))
-                   for s in r.get("seasons") or [] for e in s.get("episodes") or []}
-            for key in (ids.get("imdb"), f"trakt:{ids['trakt']}" if ids.get("trakt") else None):
-                if key:
-                    out.setdefault(key, set()).update(eps)
-        _WATCHED_SHOWS = out
-    return _WATCHED_SHOWS
+    if not isinstance(pr, dict):
+        raise _shape_error(f"/shows/{imdb}/progress/watched nevrátil objekt")
+    done = set()
+    for season in pr.get("seasons") or []:
+        for ep in season.get("episodes") or []:
+            if ep.get("completed"):
+                done.add((int(season["number"]), int(ep["number"])))
+    try:
+        completed = int(pr.get("completed") or 0)
+    except (TypeError, ValueError):
+        completed = 0
+    if completed > 0 and not done:
+        raise _shape_error(f"/shows/{imdb}/progress/watched: completed={completed}, ale žádný díl")
+    return done
 
 
 def trakt_watched_episodes(imdb: str, refresh: bool = False) -> set[tuple[int, int]]:
-    return set(trakt_watched_shows(refresh).get(imdb, set()))
+    """Zhlédnuté díly seriálu z `/shows/{id}/progress/watched` (hidden=false,
+    specials=true). Chyba se propaguje — nikdy nevrací prázdno místo chyby.
+
+    Pozor: bulk `/sync/watched/shows` tuhle informaci u některých účtů nenese
+    (vrací jen `plays`/`last_watched_at`, bez `seasons`) — proto se z něj
+    zhlédnuté díly neodvozují. Díly ve skrytých řadách tu chybí; opakovanému
+    zápisu z toho důvodu brání pojistka ve writes.py.
+    """
+    if refresh or imdb not in _WATCHED:
+        import track
+        pr = track._req("GET", f"/shows/{imdb}/progress/watched",
+                        params={"hidden": "false", "specials": "true"})[0]
+        _WATCHED[imdb] = parse_progress(imdb, pr)
+    return set(_WATCHED[imdb])
 
 
 def trakt_watched_movies() -> set[str]:
-    """Zhlédnuté filmy přímo z Traktu. Žádný fallback na lokální DB — ta je starší
-    a film scrobblovaný dnes by se zapsal podruhé."""
+    """Zhlédnuté filmy přímo z Traktu (celá historie filmů). Žádný fallback na
+    lokální DB — ta je starší a film scrobblovaný dnes by se zapsal podruhé."""
     import track
-    rows = track._req("GET", "/sync/watched/movies")[0]
-    if not isinstance(rows, list):
-        raise track.TraktError("/sync/watched/movies nevrátil seznam")
-    return {((r.get("movie") or {}).get("ids") or {}).get("imdb") for r in rows} - {None}
+    rows = track.paged("/sync/history/movies")
+    ids = {((r.get("movie") or {}).get("ids") or {}).get("imdb") for r in rows if isinstance(r, dict)}
+    ids.discard(None)
+    if rows and not ids:
+        raise _shape_error(f"/sync/history/movies: {len(rows)} záznamů, ale žádné IMDb ID")
+    return ids
 
 
 def trakt_seasons(imdb: str, refresh: bool = False) -> dict[tuple[int, int], str]:
@@ -309,6 +339,8 @@ def trakt_seasons(imdb: str, refresh: bool = False) -> dict[tuple[int, int], str
             raise track.TraktError(f"/shows/{imdb}/seasons nevrátil seznam")
         hit = {f"{int(s['number'])}:{int(e['number'])}": e.get("title") or ""
                for s in seasons for e in s.get("episodes") or []}
+        if seasons and not hit:
+            raise _shape_error(f"/shows/{imdb}/seasons: {len(seasons)} řad, ale žádný díl")
         cache.put(imdb, hit)
     return {tuple(int(x) for x in k.split(":")): v for k, v in hit.items()}
 
@@ -393,6 +425,10 @@ def compute_gaps() -> dict:
                 continue
             done = trakt_watched_episodes(trakt_id)
             missing = sorted(st["watched"] - done)
+            beyond = [p for p in st.get("beyond_anchor") or [] if p not in done]
+            if beyond:
+                gaps.setdefault("beyond_anchor", []).append(
+                    {"imdb": trakt_id, "name": st["name"], "pairs": beyond})
             if missing:
                 gaps["shows"].append({
                     "imdb": trakt_id, "name": st["name"], "last": st["last"],
@@ -430,6 +466,10 @@ def cmd_compare(args: argparse.Namespace) -> int:
             more = f" …(+{len(s['missing']) - 14})" if len(s["missing"]) > 14 else ""
             print(f"  {s['name']}: chybí {len(s['missing'])} epizod ({eps}{more})"
                   f" | v Traktu {s['trakt_has']}, ve Stremiu {s['stremio_has']}")
+    if gaps.get("beyond_anchor"):
+        print("\nBitová mapa má díly za posledním dokoukaným (nezapisuju, ověř ručně):")
+        for x in gaps["beyond_anchor"]:
+            print(f"  {x['name']}: " + ", ".join(f"S{a}E{b}" for a, b in x["pairs"][:10]))
     if gaps["unknown"]:
         print(f"\nNepíšu do Traktu (mapování neověřeno, {len(gaps['unknown'])}):")
         for u in gaps["unknown"]:
@@ -909,7 +949,11 @@ def cmd_exact(args: argparse.Namespace) -> int:
     if not target:
         print("\nCíl je prázdný — nic neměním (to by smazalo celý seriál).", file=sys.stderr)
         sys.exit(common.EXIT_REFUSED)
-    if res["unmatched"] and not args.allow_unmatched:
+    beyond = st.get("beyond_anchor") or []
+    if beyond:
+        print(f"  ⚠ bitová mapa má {len(beyond)} dílů za posledním dokoukaným "
+              f"({', '.join(f'S{a}E{b}' for a, b in beyond[:5])}) — nejisté")
+    if (res["unmatched"] or beyond) and not args.allow_unmatched:
         print("\nNěco se nenamapovalo — nic neměním. Nenamapovaný díl by z Traktu zmizel, "
               "i když ho Stremio vede jako zhlédnutý. (--allow-unmatched to dovolí.)",
               file=sys.stderr)

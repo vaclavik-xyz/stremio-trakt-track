@@ -88,7 +88,7 @@ class Settings(unittest.TestCase):
 class ForwardNetwork(unittest.TestCase):
     def setUp(self):
         helpers.clean_home()
-        b._WATCHED_SHOWS = None
+        b._WATCHED.clear()
 
     def test_failed_read_in_forward_writes_nothing(self):
         sid = "tt0000001"
@@ -97,7 +97,7 @@ class ForwardNetwork(unittest.TestCase):
         write_json(b.GAPS, {"movies": [], "shows": [], "unknown": [{"imdb": sid, "name": "S"}]})
         fake = FakeTrakt({("GET", f"/shows/{sid}/seasons"): [
             {"number": 1, "episodes": [{"number": e, "title": ""} for e in (1, 2, 3)]}],
-            ("GET", "/sync/watched/shows"): network_error()})
+            ("GET", f"/shows/{sid}/progress/watched"): network_error()})
         with mock.patch.object(track, "_req", fake):
             with self.assertRaises(track.TraktError):
                 b.cmd_forward(argparse.Namespace(yes=True, only=None, date=None, max=None,

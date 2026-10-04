@@ -49,14 +49,14 @@ def remove_ok(body, _params):
     return {"deleted": {"episodes": len(body.get("ids") or [])}, "not_found": {"ids": []}}
 
 
-def bitfield(n_videos: int, watched_idx, anchor_id: str) -> str:
+def bitfield(n_videos: int, watched_idx, anchor_id: str, anchor_length: int | None = None) -> str:
     """Build a Stremio `state.watched` string the way stremio-core serialises it."""
     buf = bytearray((n_videos + 7) // 8)
     for i in watched_idx:
         buf[i // 8] |= 1 << (i % 8)
     last = max(watched_idx)
     payload = base64.b64encode(zlib.compress(bytes(buf))).decode()
-    return f"{anchor_id}:{last + 1}:{payload}"
+    return f"{anchor_id}:{anchor_length or last + 1}:{payload}"
 
 
 def network_error(path="x"):

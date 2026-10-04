@@ -69,7 +69,7 @@ def series(sid, n, bits, anchor_ep, name="Show"):
 class Scoped(unittest.TestCase):
     def setUp(self):
         helpers.clean_home()
-        b._WATCHED_SHOWS = None
+        b._WATCHED.clear()
         for target, attr, val in ((writes, "WRITE_SLEEP", 0),):
             p = mock.patch.object(target, attr, val)
             p.start()
@@ -86,7 +86,7 @@ class Scoped(unittest.TestCase):
         lib = [{"_id": SID, "type": "series", "name": "Broken", "state": {"watched": "garbage"}},
                {"_id": "tt0000002", "type": "movie", "name": "Good", "state": {"timesWatched": 1}}]
         write_json(b.RAW, lib)
-        self.fake({("GET", "/sync/watched/movies"): []})
+        self.fake({("GET", "/sync/history/movies"): []})
         gaps = b.compute_gaps()
         self.assertEqual([u["name"] for u in gaps["unknown"]], ["Broken"])
         self.assertEqual([m["name"] for m in gaps["movies"]], ["Good"])
@@ -99,7 +99,7 @@ class Scoped(unittest.TestCase):
         seasons = [{"number": 1, "episodes": [{"number": e, "title": f"E{e}"} for e in range(1, 5)]}]
         fake = self.fake({
             ("GET", f"/shows/{SID}/seasons"): seasons,
-            ("GET", "/sync/watched/shows"): [],
+            ("GET", f"/shows/{SID}/progress/watched"): {"aired": 4, "completed": 0, "seasons": []},
             ("POST", "/sync/history"): history_ok,
         })
         args = argparse.Namespace(yes=True, only=None, date=None, max=None, include_specials=False,
