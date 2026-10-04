@@ -97,8 +97,11 @@ titles, rejected writes).
   Stremio itself, re-anchored when that list changed since the bitfield was saved.
 - A movie counts as watched when Stremio counted a play (`timesWatched`) or it was
   marked as watched — merely opening it is not enough.
-- What Trakt already has is always read **live** (`/sync/watched/shows`,
-  `/sync/watched/movies`). If any read fails, the command aborts — it never
+- What Trakt already has is always read **live** (`/shows/{id}/progress/watched`
+  per show, `/sync/history/movies`). The bulk `/sync/watched/shows` is not used: for
+  some accounts it returns play counts without any episodes. An answer that looks
+  valid but carries no data (e.g. `completed > 0` with no episodes) is treated as an
+  error. If any read fails, the command aborts — it never
   proceeds with an empty set, because "Trakt has nothing" would mean writing
   everything again.
 - Only the last watched episode has a real date in Stremio; older ones are written

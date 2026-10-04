@@ -23,8 +23,15 @@ Každý zápis do historie je pro Trakt další zhlédnutí. Z toho plyne větš
 - `write_log.jsonl` + pojistka proti opakování: když Trakt zápis přijme, ale čtecí
   endpoint ho nevidí (skrytá řada v `progress/watched`, sloučené IMDb ID), dřív se
   totéž zapisovalo každou noc. Teď se to po prvním zápisu jen ohlásí;
-- čte se `/sync/watched/shows` místo `/shows/{id}/progress/watched` — jedno volání
-  a zahrnuje i skryté řady.
+- `/sync/watched/shows` se **nepoužívá**: u některých účtů vrací jen `plays`
+  a `last_watched_at`, bez `seasons` (ověřeno syrovým HTTP, i s `extended=full`).
+  Krátce byl nasazený a `compare` pak chtěl doplnit 302 dílů, které v Traktu už
+  byly — čtení „neselhalo“, takže gate v cronu nic nepoznal. Teď se čte
+  `/shows/{id}/progress/watched` po seriálech a odpověď, která vypadá platně, ale
+  nemá data (`completed > 0` bez dílů, filmy bez IMDb ID, řady bez dílů), je chyba.
+  Díly ve skrytých řadách v progress chybí; opakovanému zápisu brání pojistka.
+- Bity bitové mapy za kotvou (index ≥ `anchor_length`) se nepočítají. V živých
+  datech existují i zjevně nesmyslné (kotva S0E1, nastavený bit 199); jen se hlásí.
 
 ## Bitová mapa Stremia
 
