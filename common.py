@@ -25,6 +25,7 @@ EXIT_ERROR = 1
 EXIT_REFUSED = 2
 EXIT_LOCKED = 3
 EXIT_GUARD = 4
+EXIT_AUTH = 5        # přihlášení nefunguje a bez člověka se neopraví
 EXIT_WARN = 10
 
 DEFAULTS: dict = {
@@ -32,11 +33,65 @@ DEFAULTS: dict = {
     "match_threshold": 0.6,       # title similarity needed to pair episodes
     "repeat_guard_days": 7,       # same item written again within N days = anomaly
     "max_auto": 8,                # cron fills at most this many episodes per show
-    "issue_remind_days": 7,       # cron repeats a lingering issue every N days
+    "issue_remind_days": 3,       # cron repeats an unchanged issue every N days
     "prune_max_rows": 50,         # sync refuses to drop more rows than this …
     "prune_max_fraction": 0.05,   # … or this share of the table
     "backup_dir": None,           # None = iCloud Drive
+    "retry_delays": [2, 10, 30],  # pauses before retrying a failed read (seconds)
+    "stale_hours": 36,            # no successful run for this long = tracking stopped
+    "heartbeat_url": None,        # optional dead man's switch pinged after a good run
 }
+
+# Environment flag set by cron for its children: interactive paths (device flow,
+# password prompt) must refuse instead of waiting for input nobody will give.
+NONINTERACTIVE_ENV = "TRAKT_TRACKER_NONINTERACTIVE"
+
+
+def now() -> float:
+    """Current time; one place for tests to fake the clock."""
+    return time.time()
+
+
+def sleep(seconds: float) -> None:
+    """time.sleep, patchable in tests."""
+    time.sleep(seconds)
+
+
+def interactive_allowed() -> bool:
+    return not os.environ.get(NONINTERACTIVE_ENV)
+
+
+def require_interactive(what: str, fix: str) -> None:
+    """Exit with EXIT_AUTH when an interactive step is reached from cron."""
+    if not interactive_allowed():
+        print(f"{what} potřebuje člověka a v automatickém běhu se nespouští. Náprava: {fix}",
+              file=sys.stderr)
+        sys.exit(EXIT_AUTH)
+
+
+def retry_delays() -> list[float]:
+    try:
+        return [float(x) for x in settings()["retry_delays"]]
+    except (TypeError, ValueError):
+        return list(DEFAULTS["retry_delays"])
+
+
+LAST_SUCCESS = DATA_DIR / "last_success.json"
+
+
+def stale_message(at: float | None = None) -> str | None:
+    """"Tracking stojí od …", když poslední úspěšný denní běh je starší než
+    `stale_hours`; None, když je vše v pořádku nebo se ještě nikdy neběželo."""
+    data = read_json(LAST_SUCCESS, None)
+    if not isinstance(data, dict) or not data.get("epoch"):
+        return None
+    t = now() if at is None else at
+    hours = (t - float(data["epoch"])) / 3600
+    if hours <= float(settings()["stale_hours"]):
+        return None
+    since = dt.datetime.fromtimestamp(float(data["epoch"])).astimezone().strftime("%-d. %-m. %H:%M")
+    return (f"Tracking stojí od {since} ({hours:.0f} h bez úspěšného běhu). "
+            "Zkontroluj: python3 doctor.py")
 
 
 def settings() -> dict:

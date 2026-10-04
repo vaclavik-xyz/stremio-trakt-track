@@ -163,6 +163,11 @@ def main() -> None:
 
     out = make_snapshot(dst)
     removed = prune(dst)
+    # nezávislý hlídač denního běhu: záloha běží jako samostatný job, takže se
+    # ozve, i když denní doplnění přestalo běžet (i s --quiet)
+    stale = common.stale_message()
+    if stale:
+        print(stale)
     size = sum(s.stat().st_size for s in snapshots(dst))
     if args.quiet:
         return                      # ticho = dobře; chyby hlásí make_snapshot na stderr

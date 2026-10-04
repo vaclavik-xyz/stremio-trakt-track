@@ -53,11 +53,16 @@ class IssueReminders(unittest.TestCase):
         day = 86400
         t0 = 1_800_000_000
         cur = {"unknown|tt1": "Show: neověřeno"}
-        self.assertEqual(len(cron_daily.issues_to_report(cur, now=t0, remind_days=7)), 1)
+        self.assertEqual(cron_daily.issues_to_report(cur, now=t0, remind_days=7), ["unknown|tt1"])
         self.assertEqual(cron_daily.issues_to_report(cur, now=t0 + day, remind_days=7), [])
-        self.assertIn("trvá 7 dní", cron_daily.issues_to_report(cur, now=t0 + 7 * day, remind_days=7)[0])
-        self.assertEqual(cron_daily.issues_to_report({}, now=t0 + 8 * day, remind_days=7), [])
-        self.assertIn("nové", cron_daily.issues_to_report(cur, now=t0 + 9 * day, remind_days=7)[0])
+        self.assertEqual(cron_daily.issues_to_report(cur, now=t0 + 7 * day, remind_days=7), ["unknown|tt1"])
+        self.assertEqual(cron_daily.issues_to_report(cur, now=t0 + 8 * day, remind_days=7), [])
+        changed = {"unknown|tt1": "Show: neověřeno — jiný důvod"}
+        self.assertEqual(cron_daily.issues_to_report(changed, now=t0 + 9 * day, remind_days=7),
+                         ["unknown|tt1"], "changed text is reported at once")
+        self.assertEqual(cron_daily.issues_to_report({}, now=t0 + 10 * day, remind_days=7), [])
+        self.assertEqual(cron_daily.issues_to_report(cur, now=t0 + 11 * day, remind_days=7),
+                         ["unknown|tt1"], "came back = new")
 
 
 def series(sid, n, bits, anchor_ep, name="Show"):

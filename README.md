@@ -86,8 +86,20 @@ Common flags: `--yes` (actually write), `--only <imdb>`, `--include-specials`,
 `--json` (on `compare` and `forward`), `--force-repeat` (see below).
 
 Exit codes: `0` ok, `1` error, `2` refused (e.g. unsafe `exact`), `3` another run
-holds the lock, `4` sync prune guard, `10` finished with warnings (unverified
-titles, rejected writes).
+holds the lock, `4` sync prune guard, `5` login broken (needs a human), `10`
+finished with warnings (unverified titles, rejected writes).
+
+### Health check
+
+```bash
+python3 doctor.py               # everything, incl. Trakt/Stremio logins
+python3 doctor.py --offline     # local state only
+```
+
+Checks the daily run watchdog, Trakt token (and that refreshing it works — by a real
+call when there is no recent proof), Stremio session, library and unverified shows,
+caches, journals and the lock, the backup age and the database. Every failed item
+says which command fixes it. Exit code `0` ok, `10` warnings, `1` something broken.
 
 ## How it works
 
@@ -137,9 +149,15 @@ does not create duplicates.
 
 ## Automation
 
-`cron_daily.py` runs fetch → compare → push → `forward --max 8` → `track.py sync`
-and prints only what was written, what needs a decision, or what failed (silence
-means all good). `cron_weekly.py` prints a weekly recap. `backup_db.py` makes a
+`cron_daily.py` runs `track.py auth-check` → fetch → compare → push →
+`forward --max 8` → `track.py sync` and prints only what was written and what needs
+attention; silence means everything ran. A problem that was already reported and has
+not changed is repeated only after `issue_remind_days` (3). Child steps run with
+`TRAKT_TRACKER_NONINTERACTIVE=1` and no stdin, so nothing can wait for a password or a
+device code. Transient network errors (5xx, timeouts) are retried for reads; writes
+are never re-sent after an ambiguous error — the next run fills in whatever is still
+missing from live data. After a fully successful run it writes `last_success.json`
+and, if `settings.heartbeat_url` is set, pings it. `cron_weekly.py` prints a weekly recap. `backup_db.py` makes a
 consistent `VACUUM INTO` snapshot of `tracker.db` (to iCloud Drive by default; see
 `--to`, `TRAKT_BACKUP_DIR` or `settings.backup_dir`), keeps 30 days plus the latest
 snapshot of each of the last 12 months, and verifies each snapshot.
@@ -154,6 +172,45 @@ MAILTO=you@example.com
 ```
 
 On macOS you can use a LaunchAgent instead — see `docs/launchd.example.plist`.
+Running the daily job twice a day (e.g. 23:30 and 05:30) is safe — every run compares
+live data and the lock prevents overlap — and covers a Trakt outage at night.
+
+## When tracking stops
+
+Silence from the daily job means it ran. If something breaks, the job says so; if the
+job itself stops running, the weekly recap and the backup job report "Tracking
+stojí od …" once the last successful run is older than 36 hours, and `doctor.py`
+shows it too. Nothing on this machine can notice that *all* scheduled jobs stopped —
+for that, set `settings.heartbeat_url` to a dead man's switch service (any URL that
+alerts you when it is not called for a day, e.g. a self-hosted or hosted
+"healthchecks" style check).
+
+Start with `python3 doctor.py`. The five most likely causes:
+
+1. **Trakt login expired or refresh failed** — report says "Obnovení Trakt tokenu
+   selhalo" or "přihlášení nefunguje", exit code 5. Tokens last about a week and are
+   refreshed a day ahead, so a broken refresh is reported while the old token still
+   works. Fix: `python3 track.py auth` in a terminal (device flow: open the shown URL,
+   type the code). Needs `client_secret` in `config.json` for automatic refresh.
+2. **Stremio session gone** ("Session does not exist", "Stremio přihlášení neplatí").
+   This cannot be repaired automatically because it needs your Stremio password.
+   Until you fix it, nothing is filled in. Fix: `bash setup_stremio.sh`.
+3. **A show cannot be verified** (listed under "Nesynchronizuje se"; its watched
+   bitfield does not map onto Trakt's episodes, typically split double episodes).
+   The job fills the gap up to the last watched episode automatically for up to 8
+   missing episodes. Bigger gaps: look at `python3 stremio_bridge.py forward --only
+   <imdb>` (dry-run), then add `--yes`; or make the show match exactly with
+   `exact --only <imdb>`.
+4. **Trakt or Stremio temporarily unavailable** ("nedostupné", HTTP 5xx, timeouts).
+   Reads are retried; if it still fails, nothing is written that day and the next run
+   catches up from live data. Fix: wait. Run `python3 cron_daily.py` by hand later if
+   you do not want to wait for the next night.
+5. **The scheduled job does not run at all** ("Tracking stojí od …" from the weekly or
+   backup job, or `doctor.py`). Check that the scheduler still knows the job:
+   `crontab -l` (cron) or `launchctl list | grep stremio` (launchd); look at the log
+   files from the plist; run `python3 cron_daily.py` by hand and read its output. On
+   macOS, cron may need "Full Disk Access" for `/usr/sbin/cron` if the code lives in
+   Documents.
 
 ## Settings
 
@@ -162,8 +219,9 @@ Optional `"settings"` block in `config.json` (defaults shown):
 ```json
 "settings": {
   "cache_ttl_hours": 24, "match_threshold": 0.6, "repeat_guard_days": 7,
-  "max_auto": 8, "issue_remind_days": 7,
-  "prune_max_rows": 50, "prune_max_fraction": 0.05, "backup_dir": null
+  "max_auto": 8, "issue_remind_days": 3,
+  "prune_max_rows": 50, "prune_max_fraction": 0.05, "backup_dir": null,
+  "retry_delays": [2, 10, 30], "stale_hours": 36, "heartbeat_url": null
 }
 ```
 

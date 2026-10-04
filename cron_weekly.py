@@ -53,6 +53,11 @@ def main() -> None:
     fmt = "%-d. %-m."
     print(f"## Týden ve sledování ({start.strftime(fmt)}–{now.strftime(fmt)})")
     print()
+    # nezávislý hlídač: když denní běh umřel, ozve se aspoň týdenní přehled
+    stale = common.stale_message()
+    if stale:
+        print(f"🛑 **{stale}**")
+        print()
 
     if not movies and not eps:
         print("Tento týden nic nového.")

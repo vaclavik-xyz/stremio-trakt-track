@@ -67,7 +67,9 @@ ITEM_ERRORS = (BridgeError, ValueError, KeyError, TypeError, IndexError, Attribu
 
 def load_stremio() -> dict:
     if not STREMIO_CFG.exists():
-        sys.exit("Chybí přihlášení ke Stremiu. Spusť: bash setup_stremio.sh")
+        print("Chybí přihlášení ke Stremiu.", file=sys.stderr)
+        print(STREMIO_FIX, file=sys.stderr)
+        sys.exit(common.EXIT_AUTH)
     return json.loads(STREMIO_CFG.read_text())
 
 
@@ -75,26 +77,57 @@ def save_stremio(cfg: dict) -> None:
     common.atomic_write_json(STREMIO_CFG, cfg, indent=2)
 
 
+STREMIO_FIX = ("Náprava: bash setup_stremio.sh (potřebuje heslo ke Stremiu). Do té doby most "
+               "nic nedoplňuje.")
+
+
+def _http_json(req: urllib.request.Request, timeout: int, label: str):
+    """GET/POST s opakováním u přechodných chyb (5xx, timeout, síť). Volá se jen
+    pro čtení — Stremio i Cinemeta most nikdy nemění. Vyčerpané pokusy → BridgeError."""
+    delays = common.retry_delays()
+    last = ""
+    for attempt in range(len(delays) + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code < 500 and e.code != 429:
+                raise BridgeError(f"{label} HTTP {e.code}: "
+                                  f"{e.read()[:200].decode(errors='replace')}") from None
+            last = f"HTTP {e.code}"
+        except urllib.error.URLError as e:
+            last = f"síťová chyba: {e.reason}"
+        except (TimeoutError, OSError) as e:
+            last = f"síťová chyba: {e}"
+        except ValueError as e:
+            raise BridgeError(f"{label}: neplatná odpověď ({e})") from None
+        if attempt < len(delays):
+            common.sleep(delays[attempt])
+    raise BridgeError(f"{label}: {last} (ani po {len(delays) + 1} pokusech)")
+
+
 def s_call(path: str, payload: dict) -> object:
     req = urllib.request.Request(
         SAPI + path, data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json", "User-Agent": UA}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        sys.exit(f"Stremio API HTTP {e.code}: {e.read()[:200].decode(errors='replace')}")
-    except urllib.error.URLError as e:
-        sys.exit(f"Síťová chyba u Stremia: {e.reason}")
-    except (TimeoutError, OSError, ValueError) as e:
-        sys.exit(f"Stremio API: {e}")
+        data = _http_json(req, 30, "Stremio API")
+    except BridgeError as e:
+        sys.exit(str(e))
     if isinstance(data, dict) and data.get("error"):
-        sys.exit(f"Stremio API: {data['error'].get('message')}")
+        err = data["error"]
+        msg = (err.get("message") if isinstance(err, dict) else str(err)) or "?"
+        if "session" in msg.lower() or "auth" in msg.lower():
+            print(f"Stremio přihlášení neplatí ({msg}).", file=sys.stderr)
+            print(STREMIO_FIX, file=sys.stderr)
+            sys.exit(common.EXIT_AUTH)
+        sys.exit(f"Stremio API: {msg}")
     return data.get("result") if isinstance(data, dict) else data
 
 
 def cmd__login(args: argparse.Namespace) -> None:
     """Interní – volá ho setup_stremio.sh. Heslo jde po stdin, nikdy do logu."""
+    common.require_interactive("Přihlášení ke Stremiu", "bash setup_stremio.sh v terminálu")
     password = sys.stdin.read().strip()
     if not password:
         sys.exit("Prázdné heslo.")
@@ -180,12 +213,8 @@ def cinemeta_videos(stremio_id: str, refresh: bool = False) -> list[list]:
         hit = cache.get(stremio_id)
         if hit:
             return [list(x) for x in hit]
-    try:
-        req = urllib.request.Request(CINEMETA.format(stremio_id), headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=25) as r:
-            meta = (json.loads(r.read()) or {}).get("meta") or {}
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
-        raise BridgeError(f"metadata z Cinemety pro {stremio_id} se nepovedla: {e}") from None
+    req = urllib.request.Request(CINEMETA.format(stremio_id), headers={"User-Agent": UA})
+    meta = (_http_json(req, 25, f"Cinemeta {stremio_id}") or {}).get("meta") or {}
     videos = []
     for v in meta.get("videos") or []:
         s, e = v.get("season"), v.get("episode", v.get("number"))

@@ -54,9 +54,22 @@ class TraktError(RuntimeError):
     pass
 
 
+RETRY_STATUS = {500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527, 530}
+AUTH_STATE = HERE / "auth_state.json"
+REFRESH_MARGIN = 86400          # obnov token, když do vypršení zbývá méně než den
+
+
 def _req(method: str, path: str, params: dict | None = None,
          body: dict | None = None, auth: bool = True,
          cfg: dict | None = None) -> tuple[object, dict]:
+    """Jedno volání Trakt API.
+
+    Přechodné chyby (5xx, timeout, výpadek sítě) se u čtení (GET) zkouší znovu
+    s odstupem `retry_delays`; teprve pak TraktError. Zápisy (POST) se po
+    nejednoznačné chybě znovu neposílají: request mohl projít a Trakt by zápis
+    započítal dvakrát. Zbytek doplní další běh podle živého stavu. 429 (limit) se
+    čeká podle Retry-After u obou — Trakt ho vrací dřív, než request zpracuje.
+    """
     cfg = cfg or load_config()
     url = BASE + path
     if params:
@@ -70,8 +83,12 @@ def _req(method: str, path: str, params: dict | None = None,
     if auth:
         headers["Authorization"] = "Bearer " + access_token()
     data = json.dumps(body).encode() if body is not None else None
+    delays = common.retry_delays()
+    retryable = method == "GET"
+    last_error = ""
 
-    for attempt in range(4):
+    for attempt in range(len(delays) + 1):
+        wait = delays[attempt] if attempt < len(delays) else None
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
@@ -82,50 +99,97 @@ def _req(method: str, path: str, params: dict | None = None,
         except urllib.error.HTTPError as e:
             raw = e.read()
             detail = raw[:300].decode(errors="replace")
-            if e.code == 429:
-                wait = int(e.headers.get("Retry-After") or 2)
-                print(f"  rate limit, čekám {wait}s…", file=sys.stderr)
-                time.sleep(wait + 1)
+            if e.code == 429 and wait is not None:
+                try:
+                    wait = min(60.0, float(e.headers.get("Retry-After") or wait))
+                except ValueError:
+                    pass
+                print(f"  rate limit, čekám {wait:.0f}s…", file=sys.stderr)
+                common.sleep(wait + 1)
+                last_error = "HTTP 429 (limit)"
                 continue
             if e.code == 423:
                 raise TraktError("Účet je zamčený – spusť history analysis na trakt.tv/settings/data.") from None
             if e.code == 426:
                 raise TraktError("Tahle metoda je VIP-only.") from None
+            if e.code == 401 and auth:
+                raise TraktError(f"{method} {path} -> HTTP 401: přihlášení k Traktu neplatí "
+                                 "(náprava: python3 track.py auth)") from None
+            if e.code in RETRY_STATUS and retryable and wait is not None:
+                last_error = f"HTTP {e.code}"
+                common.sleep(wait)
+                continue
             raise TraktError(f"{method} {path} -> HTTP {e.code}: {detail}") from None
         except urllib.error.URLError as e:
-            raise TraktError(f"Síťová chyba u {path}: {e.reason}") from None
+            last_error = f"Síťová chyba u {path}: {e.reason}"
         except (TimeoutError, OSError) as e:
             # timeout while reading the body is not wrapped in URLError
-            raise TraktError(f"Síťová chyba u {path}: {e}") from None
+            last_error = f"Síťová chyba u {path}: {e}"
         except ValueError as e:
             raise TraktError(f"{method} {path}: neplatná odpověď ({e})") from None
-    raise TraktError(f"{method} {path}: rate limit se nevyřešil")
+        if not retryable or wait is None:
+            raise TraktError(last_error)
+        common.sleep(wait)
+    raise TraktError(f"{method} {path}: nepovedlo se ani po {len(delays) + 1} pokusech ({last_error})")
 
 
-def _token_expired(cfg: dict) -> bool:
-    tok = cfg.get("token") or {}
-    expires = tok.get("expires_at", 0)
-    return time.time() > (expires - 86400)  # obnov den předem
+def _auth_fail(msg: str) -> None:
+    print(msg, file=sys.stderr)
+    print("Náprava: python3 track.py auth", file=sys.stderr)
+    sys.exit(common.EXIT_AUTH)
+
+
+def _note_refresh(ok: bool, error: str = "") -> None:
+    state = common.read_json(AUTH_STATE, {})
+    stamp = dt.datetime.fromtimestamp(common.now()).astimezone().isoformat(timespec="seconds")
+    if ok:
+        state.update({"refresh_ok_at": stamp, "refresh_ok_epoch": common.now()})
+        state.pop("refresh_failed_at", None)
+        state.pop("refresh_error", None)
+    else:
+        state.update({"refresh_failed_at": stamp, "refresh_error": error})
+    common.atomic_write_json(AUTH_STATE, state)
+
+
+def token_remaining(cfg: dict | None = None) -> float | None:
+    tok = (cfg or load_config()).get("token") or {}
+    if not tok.get("access_token"):
+        return None
+    return float(tok.get("expires_at") or 0) - common.now()
 
 
 def access_token() -> str:
+    """Platný access token. Nikdy nic interaktivního.
+
+    Obnova začne, když do vypršení zbývá méně než REFRESH_MARGIN — tedy ještě
+    s platným tokenem. Když obnova selže a token pořád platí, běh pokračuje,
+    selhání se zapíše do auth_state.json (cron ho ohlásí) a na stderr jde náprava.
+    Když token už neplatí, příkaz skončí s EXIT_AUTH.
+    """
     cfg = load_config()
     tok = cfg.get("token") or {}
     if not tok.get("access_token"):
-        sys.exit("Nejsi přihlášený. Spusť: python3 track.py auth")
-    if _token_expired(cfg):
+        _auth_fail("Trakt: nejsi přihlášený.")
+    remaining = float(tok.get("expires_at") or 0) - common.now()
+    if remaining < REFRESH_MARGIN:
         try:
             refresh_token()
         except TraktError as e:
-            sys.exit(f"Token vypršel a obnovení selhalo ({e}).\nSpusť znovu: python3 track.py auth")
-        cfg = load_config()
-        tok = cfg.get("token") or {}
+            _note_refresh(False, str(e))
+            if remaining > 0:
+                print(f"! Obnovení Trakt tokenu selhalo ({e}); token platí ještě "
+                      f"{remaining / 3600:.0f} h. Náprava: python3 track.py auth", file=sys.stderr)
+                return tok["access_token"]
+            _auth_fail(f"Trakt token vypršel a obnovení selhalo ({e}).")
+        tok = load_config().get("token") or {}
     return tok["access_token"]
 
 
 def refresh_token() -> None:
     cfg = load_config()
     tok = cfg.get("token") or {}
+    if not tok.get("refresh_token"):
+        raise TraktError("chybí refresh token")
     body = {
         "grant_type": "refresh_token",
         "refresh_token": tok.get("refresh_token"),
@@ -135,8 +199,11 @@ def refresh_token() -> None:
     if cfg.get("client_secret"):
         body["client_secret"] = cfg["client_secret"]
     payload, _ = _req("POST", "/oauth/token", body=body, auth=False, cfg=cfg)
+    if not isinstance(payload, dict) or not payload.get("access_token"):
+        raise TraktError("obnova tokenu nevrátila access_token")
     store_token(cfg, payload)
-    print("Token obnoven.")
+    _note_refresh(True)
+    print("Token obnoven.", file=sys.stderr)
 
 
 def store_token(cfg: dict, payload: dict) -> None:
@@ -144,7 +211,7 @@ def store_token(cfg: dict, payload: dict) -> None:
     cfg["token"] = {
         "access_token": payload["access_token"],
         "refresh_token": payload.get("refresh_token"),
-        "expires_at": int(time.time()) + expires_in,
+        "expires_at": int(common.now()) + expires_in,
         "created_at": payload.get("created_at") or dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     save_config(cfg)
@@ -154,6 +221,7 @@ def store_token(cfg: dict, payload: dict) -> None:
 
 
 def cmd_auth(_args: argparse.Namespace) -> None:
+    common.require_interactive("Přihlášení k Traktu (device flow)", "python3 track.py auth v terminálu")
     cfg = load_config()
     payload, _ = _req("POST", "/oauth/device/code",
                       body={"client_id": cfg["client_id"]}, auth=False, cfg=cfg)
@@ -700,6 +768,22 @@ def cmd_report_all(_args: argparse.Namespace) -> None:
     con.close()
 
 
+def cmd_auth_check(_args: argparse.Namespace) -> None:
+    """Neinteraktivní kontrola přihlášení pro cron: obnoví token s předstihem
+    a ověří ho voláním API. rc 0 = funguje, 5 = potřebuje člověka, 1 = síť."""
+    access_token()
+    try:
+        me = _req("GET", "/users/settings")[0] or {}
+    except TraktError as e:
+        if "HTTP 401" in str(e):
+            _auth_fail(f"Trakt odmítl token ({e}).")
+        print(f"Trakt nedostupný: {e}", file=sys.stderr)
+        sys.exit(common.EXIT_ERROR)
+    remaining = token_remaining() or 0
+    print(f"Trakt OK ({(me.get('user') or {}).get('username') or '?'}), "
+          f"token platí ještě {remaining / 86400:.1f} dne.")
+
+
 def cmd_status(_args: argparse.Namespace) -> None:
     con = db()
     for table, label in (("live_movies", "filmy"), ("live_episodes", "epizody"),
@@ -836,6 +920,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Trakt tracker")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("auth", help="přihlášení přes device flow").set_defaults(func=cmd_auth)
+    sub.add_parser("auth-check", help="ověří přihlášení (bez interakce, pro cron)").set_defaults(
+        func=cmd_auth_check)
     sy = sub.add_parser("sync", help="stáhne data z Traktu do tracker.db")
     sy.add_argument("--allow-mass-delete", action="store_true",
                     help="dovolit označit jako smazané i velkou část historie")

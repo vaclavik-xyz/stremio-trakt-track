@@ -12,6 +12,8 @@ tracker.db-journal
 alias.json
 write_log.jsonl
 issues_state.json
+auth_state.json
+last_success.json
 .lock
 *.sqlite
 *.sqlite.tmp
