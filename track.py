@@ -798,6 +798,40 @@ def cmd_watchtime(args: argparse.Namespace) -> None:
     con.close()
 
 
+def cmd_export(args: argparse.Namespace) -> None:
+    """Kopie archivu mimo SQLite: CSV (movies.csv, episodes.csv) nebo jeden JSON.
+
+    Výchozí jsou jen živé záznamy; `--include-deleted` přidá i to, co z Traktu
+    zmizelo (sloupec deleted_at)."""
+    import csv
+    import io
+    con = db()
+    where = "" if args.include_deleted else " WHERE deleted_at IS NULL"
+    tables = {}
+    for name, table in (("movies", "watched_movies"), ("episodes", "watched_episodes")):
+        cur = con.execute(f"SELECT * FROM {table}{where} ORDER BY watched_at")
+        names = [d[0] for d in cur.description]
+        keep = [i for i, c in enumerate(names) if args.include_deleted or c != "deleted_at"]
+        tables[name] = ([names[i] for i in keep],
+                        [tuple(r[i] for i in keep) for r in cur.fetchall()])
+    con.close()
+    out = pathlib.Path(args.out).expanduser()
+    if args.format == "json":
+        target = out / "trakt-export.json" if out.is_dir() else out
+        data = {name: [dict(zip(cols, r)) for r in rows] for name, (cols, rows) in tables.items()}
+        common.atomic_write_json(target, data, indent=1)
+        print(f"Uloženo: {target} ({len(data['movies'])} filmů, {len(data['episodes'])} epizod)")
+        return
+    out.mkdir(parents=True, exist_ok=True)
+    for name, (cols, rows) in tables.items():
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(cols)
+        w.writerows(rows)
+        common.atomic_write_text(out / f"{name}.csv", buf.getvalue())
+        print(f"Uloženo: {out / f'{name}.csv'} ({len(rows)} řádků)")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Trakt tracker")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -816,6 +850,12 @@ def main() -> None:
     wt.add_argument("--from-year", type=int, default=2005, help="od kterého roku počítat odhad")
     wt.add_argument("--hours-per-day", type=float, default=2.0, help="průměr h/den do odhadu")
     wt.set_defaults(func=cmd_watchtime)
+    ex = sub.add_parser("export", help="export archivu do CSV nebo JSON")
+    ex.add_argument("--format", choices=("csv", "json"), default="csv")
+    ex.add_argument("--out", required=True, help="cílová složka (CSV) nebo soubor/složka (JSON)")
+    ex.add_argument("--include-deleted", action="store_true",
+                    help="i záznamy, které z Traktu zmizely")
+    ex.set_defaults(func=cmd_export)
     args = ap.parse_args()
     args.func(args)
 

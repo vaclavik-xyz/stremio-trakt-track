@@ -960,6 +960,8 @@ def cmd_exact(args: argparse.Namespace) -> int:
     journal.save()
     print(f"  kontrola: Trakt teď má {len(after_cmp)}, cíl {len(target)} → "
           f"{'sedí' if ok else 'NESEDÍ: ' + str(sorted(after_cmp ^ target)[:10])}")
+    if journal["removed"]:
+        print("  vrátit jde: python3 stremio_bridge.py restore --from-journal last_exact.json")
     return common.EXIT_OK if ok else common.EXIT_WARN
 
 
@@ -971,6 +973,137 @@ def _drop_pushed(imdb: str, pairs) -> None:
     drop = {(imdb, int(s), int(e)) for s, e in pairs}
     pushed["episodes"] = [x for x in pushed.get("episodes") or [] if tuple(x) not in drop]
     common.atomic_write_json(PUSHED, pushed)
+
+
+# ------------------------------------------------------------------ restore
+
+
+def _sig_keys(kind: str, ids: dict, season, episode, watched_at) -> set[tuple]:
+    """Podpisy záznamu pro porovnání s historií: stejný titul (podle kteréhokoli
+    ID), díl a čas zhlédnutí."""
+    when = str(watched_at or "")[:19]
+    return {(kind, f"{k}:{ids[k]}", season, episode, when)
+            for k in ("trakt", "imdb") if ids.get(k)}
+
+
+def restore_candidates_from_journal(path: pathlib.Path) -> list[dict]:
+    """Smazané záznamy z deníku `exact` (removed) nebo `redate` (remove_entries
+    u řádků, kde se opravdu smazaly)."""
+    data = common.read_json(path, None)
+    if data is None:
+        sys.exit(f"Deník {path} se nedá přečíst.")
+    out = list(data.get("removed") or [])
+    for row in data.get("shows") or []:
+        gone = set(row.get("removed") or [])
+        out += [e for e in row.get("remove_entries") or [] if e.get("history_id") in gone]
+    return out
+
+
+def restore_candidates_from_log(since: str | None) -> list[dict]:
+    return [r for r in writes.log_records()
+            if r.get("op") == "remove" and (not since or str(r.get("ts", "")) >= since)]
+
+
+def restore_candidates_from_db(path: pathlib.Path, since: str | None) -> list[dict]:
+    """Záznamy, které ve snapshotu tracker.db jsou (a nebyly v něm smazané)."""
+    import sqlite3
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(watched_episodes)")}
+        live = " WHERE deleted_at IS NULL" if "deleted_at" in cols else ""
+        out = [{"kind": "movie", "ids": {"trakt": tid, "imdb": imdb}, "watched_at": w,
+                "name": title, "history_id": hid}
+               for hid, tid, imdb, title, w in con.execute(
+                   f"SELECT history_id, trakt_id, imdb, title, watched_at FROM watched_movies{live}")]
+        out += [{"kind": "episode", "ids": {"trakt": sid}, "season": s, "episode": e,
+                 "watched_at": w, "name": title, "history_id": hid}
+                for hid, sid, title, s, e, w in con.execute(
+                    "SELECT history_id, show_id, show_title, season, episode, watched_at "
+                    f"FROM watched_episodes{live}")]
+    finally:
+        con.close()
+    for c in out:
+        c["ids"] = {k: v for k, v in c["ids"].items() if v}
+    return [c for c in out if not since or str(c.get("watched_at") or "") >= since]
+
+
+def current_history_signatures() -> set[tuple]:
+    import track
+    sigs: set[tuple] = set()
+    for r in track.paged("/sync/history/movies"):
+        ids = (r.get("movie") or {}).get("ids") or {}
+        sigs |= _sig_keys("movie", ids, None, None, r.get("watched_at"))
+    for r in track.paged("/sync/history/episodes"):
+        ids = (r.get("show") or {}).get("ids") or {}
+        ep = r.get("episode") or {}
+        sigs |= _sig_keys("episode", ids, ep.get("season"), ep.get("number"), r.get("watched_at"))
+    return sigs
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    """Vrátí do Traktu smazané záznamy historie s původním `watched_at`.
+
+    Zdroj: deník (`--from-journal last_exact.json`), write_log.jsonl (`--from-log`)
+    nebo snapshot databáze (`--from-db zaloha.sqlite`). Co v historii Traktu už je
+    (stejný titul, díl a čas), se přeskočí — opakované spuštění nic nezdvojí.
+    """
+    if args.from_journal:
+        cands = restore_candidates_from_journal(pathlib.Path(args.from_journal).expanduser())
+    elif args.from_db:
+        cands = restore_candidates_from_db(pathlib.Path(args.from_db).expanduser(), args.since)
+    else:
+        cands = restore_candidates_from_log(args.since)
+    if args.only:
+        cands = [c for c in cands if args.only in (c.get("ids") or {}).values()
+                 or args.only.lower() in str(c.get("name") or "").lower()]
+    if not cands:
+        print("Nic k obnovení.")
+        return common.EXIT_OK
+
+    present = current_history_signatures()
+    todo, seen = [], set()
+    for c in cands:
+        sig = _sig_keys(c["kind"], c.get("ids") or {}, c.get("season"), c.get("episode"),
+                        c.get("watched_at"))
+        if not sig or sig & present or frozenset(sig) in seen:
+            continue
+        seen.add(frozenset(sig))
+        todo.append(c)
+
+    print(f"Kandidátů {len(cands)}, v Traktu chybí {len(todo)}:")
+    for c in todo[:30]:
+        what = f"S{c['season']}E{c['episode']}" if c["kind"] == "episode" else "film"
+        print(f"  {c.get('name') or writes._id_key(c['ids'])} {what} — {str(c.get('watched_at'))[:16]}")
+    if len(todo) > 30:
+        print(f"  … a dalších {len(todo) - 30}")
+    if not todo or not args.yes:
+        if todo:
+            print("\n(Dry-run. Pro obnovení přidej --yes.)")
+        return common.EXIT_OK
+
+    items = []
+    for c in todo:
+        when = c.get("watched_at")
+        when = None if not when or str(when).startswith("1970-01-01") else when
+        if c["kind"] == "movie":
+            items.append(writes.movie_item(c["ids"], when, c.get("name")))
+        else:
+            items.append(writes.episode_item(c["ids"], c["season"], c["episode"], when, c.get("name")))
+    journal = common.Journal(HERE / "last_restore.json", {"planned": len(items), "added": 0,
+                                                           "denied": [], "repeat": []})
+
+    def progress(res: dict) -> None:
+        journal["added"] = len(res["added"])
+        journal["denied"] = list(res["denied"])
+        journal["repeat"] = [writes.item_key(i) for i in res["repeat"]]
+        journal.save()
+
+    result = writes.add_history(items, cmd="restore", force_repeat=args.force_repeat,
+                                on_progress=progress)
+    progress(result)
+    print(f"  obnoveno {len(result['added'])} z {len(items)}")
+    _report_write(result)
+    return common.EXIT_WARN if (result["denied"] or result["repeat"]) else common.EXIT_OK
 
 
 def main() -> None:
@@ -1016,6 +1149,17 @@ def main() -> None:
     ex.add_argument("--force-repeat", action="store_true",
                     help="zapsat i to, co se zapsalo v posledních dnech")
     ex.set_defaults(func=cmd_exact)
+    rs = sub.add_parser("restore", help="vrátí do Traktu smazané záznamy s původním datem")
+    src = rs.add_mutually_exclusive_group()
+    src.add_argument("--from-journal", help="deník exact/redate (např. last_exact.json)")
+    src.add_argument("--from-log", action="store_true", help="odebrání z write_log.jsonl (výchozí)")
+    src.add_argument("--from-db", help="snapshot tracker.db ze zálohy")
+    rs.add_argument("--since", help="jen záznamy od tohoto data (ISO)")
+    rs.add_argument("--only", help="jen titul (ID nebo část názvu)")
+    rs.add_argument("--yes", action="store_true", help="skutečně zapsat")
+    rs.add_argument("--force-repeat", action="store_true",
+                    help="zapsat i to, co se zapsalo v posledních dnech")
+    rs.set_defaults(func=cmd_restore)
     args = ap.parse_args()
     if getattr(args, "yes", False):
         with common.lock():         # zápisy do Traktu nikdy dva najednou

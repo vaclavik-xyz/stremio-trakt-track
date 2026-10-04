@@ -61,6 +61,7 @@ python3 track.py report --year         # this year
 python3 track.py report --all          # lifetime, computed from history
 python3 track.py watchtime             # time spent watching + a lifetime estimate
 python3 track.py status                # row counts, last sync
+python3 track.py export --format csv --out ~/trakt-export    # CSV (or --format json) copy
 ```
 
 `sync` is a mirror, not a pile: entries deleted on Trakt are marked `deleted_at` and
@@ -78,6 +79,7 @@ python3 stremio_bridge.py push [--yes]       # add what Trakt is missing
 python3 stremio_bridge.py forward [--yes]    # fill gaps for shows compare could not verify
 python3 stremio_bridge.py exact --only <imdb> [--yes]   # make one show on Trakt match Stremio exactly
 python3 stremio_bridge.py redate [--yes]     # give a date to episodes written as "unknown"
+python3 stremio_bridge.py restore --from-journal last_exact.json [--yes]   # undo removals
 ```
 
 Common flags: `--yes` (actually write), `--only <imdb>`, `--include-specials`,
@@ -123,6 +125,12 @@ therefore:
 exact history entries by ID, and save the removed entries (with their original
 `watched_at`) before deleting. `exact` refuses to run when an episode cannot be
 paired or the target would be empty. Always look at the dry-run first.
+
+`restore` puts removed entries back with their original `watched_at`, from a run
+journal (`--from-journal`), from `write_log.jsonl` (`--from-log`, optionally
+`--since`) or from a `tracker.db` backup snapshot (`--from-db`). Entries that are
+already on Trakt (same title, episode and time) are skipped, so running it twice
+does not create duplicates.
 
 ## Automation
 
