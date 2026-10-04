@@ -36,7 +36,9 @@ DEFAULTS: dict = {
     "issue_remind_days": 3,       # cron repeats an unchanged issue every N days
     "prune_max_rows": 50,         # sync refuses to drop more rows than this …
     "prune_max_fraction": 0.05,   # … or this share of the table
-    "backup_dir": None,           # None = iCloud Drive
+    "backup_dir": None,           # off-site copy target; None = iCloud Drive, "off" = none
+    "backup_local_dir": None,     # primary local snapshots; None = <data>/backups
+    "backup_offsite_timeout_s": 30,  # hard cap for the off-site copy
     "retry_delays": [2, 10, 30],  # pauses before retrying a failed read (seconds)
     "stale_hours": 36,            # no successful run for this long = tracking stopped
     "heartbeat_url": None,        # optional dead man's switch pinged after a good run

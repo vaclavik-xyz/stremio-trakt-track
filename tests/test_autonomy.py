@@ -305,9 +305,10 @@ class DailyRun(Clocked):
 
 
 class Doctor(Clocked):
-    def test_offline_fresh_install_warns(self):
+    def test_offline_fresh_install_reports_with_fixes(self):
         res = doctor.run_checks(offline=True)
-        self.assertEqual(doctor.exit_code(res), common.EXIT_WARN)
+        # bez lokální zálohy je to problém, ne jen varování
+        self.assertEqual(doctor.exit_code(res), common.EXIT_ERROR)
         self.assertTrue(all(r["fix"] for r in res if r["status"] in (doctor.WARN, doctor.FAIL)))
 
     def test_offline_stale_fails(self):

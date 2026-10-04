@@ -90,3 +90,10 @@ datum u nich neodpovídá sledování.
 `tracker.db` se do iCloudu nepřesouvá — synchronizace na úrovni souborů umí živou
 SQLite databázi rozbít. Do iCloudu jde konzistentní snapshot (`VACUUM INTO`),
 ověřený `integrity_check` a počty řádků.
+
+Na jednom stroji se ukázalo, že iCloud umí být mrtvý tak, že visí i výpis složky
+(`InterruptedError: [Errno 4]`, služba `bird` nefunguje) — záloha do iCloudu tím
+nikdy nevznikla a databáze neměla žádnou zálohu. Proto je primární **lokální**
+snímek v `backups/` (vznikne za zlomek sekundy) a kopie mimo stroj běží
+v odděleném procesu s tvrdým limitem: vlákno zaseknuté v jádře nejde ukončit,
+proces jde zabít a opustit. Nedostupný cíl = varování, ne selhání jobu.

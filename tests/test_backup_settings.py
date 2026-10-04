@@ -32,7 +32,6 @@ class Backup(unittest.TestCase):
         self.assertEqual(con.execute("SELECT COUNT(*) FROM watched_movies").fetchone()[0], 1)
         con.close()
         self.assertEqual(stat.S_IMODE(os.stat(out).st_mode), 0o600)
-        self.assertEqual(json.loads((self.dst / "last_backup.json").read_text())["db_records"], 1)
         self.assertEqual(list(self.dst.glob("*.tmp")), [])
 
     def test_retention_uses_name_date(self):
@@ -52,7 +51,11 @@ class Backup(unittest.TestCase):
         write_json(helpers.TMP_HOME / "config.json", {"settings": {"backup_dir": "/tmp/somewhere"}})
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TRAKT_BACKUP_DIR", None)
-            self.assertEqual(str(backup_db.target_dir(None)), "/tmp/somewhere")
+            self.assertEqual(str(backup_db.offsite_dir()), "/tmp/somewhere")
+        write_json(helpers.TMP_HOME / "config.json", {"settings": {"backup_dir": "off"}})
+        os.environ.pop("TRAKT_BACKUP_DIR", None)
+        self.assertIsNone(backup_db.offsite_dir())
+        self.assertEqual(backup_db.local_dir(), helpers.TMP_HOME.resolve() / "backups")
 
 
 class Settings(unittest.TestCase):

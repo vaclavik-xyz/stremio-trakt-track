@@ -157,10 +157,22 @@ not changed is repeated only after `issue_remind_days` (3). Child steps run with
 device code. Transient network errors (5xx, timeouts) are retried for reads; writes
 are never re-sent after an ambiguous error — the next run fills in whatever is still
 missing from live data. After a fully successful run it writes `last_success.json`
-and, if `settings.heartbeat_url` is set, pings it. `cron_weekly.py` prints a weekly recap. `backup_db.py` makes a
-consistent `VACUUM INTO` snapshot of `tracker.db` (to iCloud Drive by default; see
-`--to`, `TRAKT_BACKUP_DIR` or `settings.backup_dir`), keeps 30 days plus the latest
-snapshot of each of the last 12 months, and verifies each snapshot.
+and, if `settings.heartbeat_url` is set, pings it. `cron_weekly.py` prints a weekly recap.
+
+**Backups always have a local snapshot; the off-site copy is only a bonus that must
+never block anything.** `backup_db.py` first makes a consistent `VACUUM INTO`
+snapshot of `tracker.db` in `backups/` next to the data (`settings.backup_local_dir`),
+checks it with `PRAGMA integrity_check` and row counts, and keeps 30 days plus the
+latest snapshot of each of the last 12 months. Only a failed local snapshot is an
+error (exit code 1). Then it copies the verified snapshot off the machine (iCloud
+Drive by default; `--to`, `TRAKT_BACKUP_DIR` or `settings.backup_dir`, `"off"`
+disables it) in a separate process with a hard time limit
+(`settings.backup_offsite_timeout_s`, 30 s). Cloud folders can freeze so badly that
+even listing them hangs; the copy is then killed, the run ends with a warning (exit
+code 0, repeated only when the reason changes or after a few days) and
+`backups/last_backup.json` records `offsite: false` with the reason. `doctor.py`
+reports the two separately: a missing or > 48 h old local snapshot is a problem, an
+unreachable off-site target is a warning with what to do.
 
 Example crontab (mail the output, which is empty when nothing happened):
 
@@ -220,7 +232,8 @@ Optional `"settings"` block in `config.json` (defaults shown):
 "settings": {
   "cache_ttl_hours": 24, "match_threshold": 0.6, "repeat_guard_days": 7,
   "max_auto": 8, "issue_remind_days": 3,
-  "prune_max_rows": 50, "prune_max_fraction": 0.05, "backup_dir": null,
+  "prune_max_rows": 50, "prune_max_fraction": 0.05,
+  "backup_dir": null, "backup_local_dir": null, "backup_offsite_timeout_s": 30,
   "retry_delays": [2, 10, 30], "stale_hours": 36, "heartbeat_url": null
 }
 ```

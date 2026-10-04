@@ -229,17 +229,48 @@ def check_bridge_state() -> list[dict]:
     return out
 
 
-def check_backup() -> dict:
+def check_backup() -> list[dict]:
+    """Lokální snímek (primární) a kopie mimo stroj (bonus). Cíl mimo stroj se
+    nečte přímo — jen odděleným procesem s časovým limitem, protože mrtvá
+    cloudová složka umí zablokovat i výpis adresáře."""
     import backup_db
-    dst = backup_db.target_dir(None)
-    snaps = backup_db.snapshots(dst) if dst.exists() else []
-    if not snaps:
-        return check("Záloha", WARN, f"v {dst} žádný snímek", "python3 backup_db.py")
-    newest = max(snaps, key=lambda s: s.stat().st_mtime)
-    h = age_hours(newest.stat().st_mtime)
-    status = OK if h <= 36 else (WARN if h <= 72 else FAIL)
-    return check("Záloha", status, f"{len(snaps)} snímků, nejnovější {newest.name} před {fmt_age(h)}",
-                 "" if status == OK else "python3 backup_db.py; ověř job zálohy v cronu/launchd")
+    out = []
+    local = backup_db.local_dir()
+    newest, age = backup_db.newest_local(local)
+    if newest is None:
+        out.append(check("Záloha lokálně", FAIL, f"v {local} žádný snímek — databáze nemá zálohu",
+                         "python3 backup_db.py; ověř job zálohy v cronu/launchd"))
+    else:
+        status = OK if age <= 48 else FAIL
+        out.append(check("Záloha lokálně", status, f"nejnovější {newest.name} před {fmt_age(age)}",
+                         "" if status == OK else "python3 backup_db.py; ověř job zálohy v cronu/launchd"))
+    dst = backup_db.offsite_dir()
+    if dst is None:
+        out.append(check("Záloha mimo stroj", SKIP, "vypnuto (backup_dir = off)"))
+        return out
+    meta = common.read_json(local / "last_backup.json", {})
+    info, err = backup_db.probe_offsite(dst)
+    fix = ("lokální snímky jsou v pořádku; zkontroluj cíl (iCloud: přihlášení a iCloud Drive "
+           "v Nastavení), nebo nastav settings.backup_dir na jinou složku či \"off\"")
+    if info is None:
+        last_ok = meta.get("offsite_ok_at") or "nikdy"
+        out.append(check("Záloha mimo stroj", WARN,
+                         f"mimo stroj se nezálohuje (cíl nedostupný: {err}); poslední úspěch: {last_ok}",
+                         fix))
+    elif not info["count"] or (info["age_h"] or 0) > 48:
+        reason = meta.get("offsite_reason")
+        if not info.get("exists", True):
+            what = "cílová složka neexistuje — mimo stroj se zatím nic nezazálohovalo"
+        elif info["age_h"] is None:
+            what = "ve složce cíle není žádný snímek"
+        else:
+            what = f"nejnovější snímek mimo stroj je před {fmt_age(info['age_h'])}"
+        out.append(check("Záloha mimo stroj", WARN,
+                         what + (f"; poslední pokus: {reason}" if reason and reason != "ok" else ""), fix))
+    else:
+        out.append(check("Záloha mimo stroj", OK,
+                         f"{info['count']} snímků, nejnovější před {fmt_age(info['age_h'])}"))
+    return out
 
 
 def check_db() -> dict:
