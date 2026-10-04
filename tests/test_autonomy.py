@@ -316,6 +316,16 @@ class Doctor(Clocked):
         self.assertEqual(doctor.exit_code(res), common.EXIT_ERROR)
         self.assertEqual(res[0]["status"], doctor.FAIL)
 
+    def test_corrupt_credentials_give_fail_rows_not_a_crash(self):
+        (helpers.TMP_HOME / "config.json").write_text("{not json")
+        (helpers.TMP_HOME / "stremio.json").write_text("{not json")
+        res = doctor.run_checks(offline=False)
+        rows = {r["name"]: r for r in res}
+        self.assertEqual(rows["Trakt přihlášení"]["status"], doctor.FAIL)
+        self.assertEqual(rows["Stremio přihlášení"]["status"], doctor.FAIL)
+        self.assertIn("setup_stremio.sh", rows["Stremio přihlášení"]["fix"])
+        self.assertEqual(doctor.exit_code(res), common.EXIT_ERROR)
+
     def test_refresh_verified_by_call_when_no_proof(self):
         write_config(5 * DAY)
         fake = FakeTrakt({("POST", "/oauth/token"): {"access_token": "a2", "refresh_token": "r2",

@@ -278,11 +278,16 @@ def run_checks(offline: bool = False, verify_refresh: bool = False) -> list[dict
     if offline:
         results.append(check("Trakt / Stremio", SKIP, "--offline"))
     else:
-        for fn in (lambda: check_trakt(verify_refresh), check_stremio):
+        for label, fn, fix in (
+                ("Trakt přihlášení", lambda: check_trakt(verify_refresh),
+                 "zkontroluj config.json, případně bash setup_secret.sh && python3 track.py auth"),
+                ("Stremio přihlášení", check_stremio, "bash setup_stremio.sh")):
             try:
                 r = fn()
             except SystemExit as e:
-                r = check("Přihlášení", FAIL, f"skončilo s rc {e.code}", "python3 track.py auth")
+                r = check(label, FAIL, f"skončilo s rc {e.code}", fix)
+            except Exception as e:  # noqa: BLE001 — poškozený soubor je přesně to, co má doctor ukázat
+                r = check(label, FAIL, f"{type(e).__name__}: {e}", fix)
             results += r if isinstance(r, list) else [r]
     for fn in (check_library, check_caches, check_bridge_state, check_backup, check_db):
         try:
