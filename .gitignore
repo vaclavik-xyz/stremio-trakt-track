@@ -8,8 +8,16 @@ stremio.json
 tracker.db
 tracker.db-wal
 tracker.db-shm
+tracker.db-journal
+alias.json
+write_log.jsonl
+issues_state.json
+auth_state.json
+last_success.json
+.lock
 *.sqlite
 *.sqlite.tmp
+*.tmp
 stremio_library.json
 pushed.json
 gaps.json
@@ -17,7 +25,7 @@ forward.json
 last_*.json
 last_backup.json
 
-# Cache — dá se kdykoli stáhnout znovu
+# Cache — dá se kdykoli stáhnout znovu (trakt_titles_cache.json je z verze 1)
 cinemeta_cache.json
 trakt_episodes_cache.json
 trakt_titles_cache.json
