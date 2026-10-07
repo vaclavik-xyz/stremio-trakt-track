@@ -698,11 +698,11 @@ def cmd_report_all(_args: argparse.Namespace) -> None:
         "SUM(runtime) FROM live_episodes").fetchone()
     minutes = int(mv[4] or 0) + int(ep[4] or 0)
 
-    dated = con.execute(
+    dated_count = con.execute(
         "SELECT COUNT(*) FROM live_movies WHERE watched_at >= '2000-01-01'").fetchone()[0]
-    dated += con.execute(
+    dated_count += con.execute(
         "SELECT COUNT(*) FROM live_episodes WHERE watched_at >= '2000-01-01'").fetchone()[0]
-    undated = (mv[0] + ep[0]) - dated
+    undated = (mv[0] + ep[0]) - dated_count
     rows = [("m", w, rt) for w, rt in con.execute("SELECT watched_at, runtime FROM live_movies")]
     rows += [("e", w, rt) for w, rt in con.execute("SELECT watched_at, runtime FROM live_episodes")]
     # dny a roky podle místního času, stejně jako měsíční přehled

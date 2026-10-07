@@ -152,5 +152,41 @@ class Formatting(unittest.TestCase):
         self.assertEqual(common.fmt_eps([(0, 1), (0, 2)]), "speciály E1–E2")
 
 
+class ReportAll(unittest.TestCase):
+    """`report --all` musí projít i nad záznamy bez data.
+
+    Regrese: lokální proměnná `dated` (počet) přebila funkci `dated()` a přehled
+    spadl na `TypeError: 'int' object is not callable`.
+    """
+
+    def setUp(self):
+        helpers.clean_home()
+
+    def seed(self):
+        con = track.db()
+        con.execute("INSERT INTO watched_movies(history_id, trakt_id, title, year, watched_at, "
+                    "action, imdb, tmdb, runtime) VALUES(1,1,'Movie A',2025,"
+                    "'2025-05-01T10:00:00.000Z','watch','tt0000001',NULL,100)")
+        con.execute("INSERT INTO watched_movies(history_id, trakt_id, title, year, watched_at, "
+                    "action, imdb, tmdb, runtime) VALUES(2,2,'Movie B',2026,"
+                    "'1970-01-01T00:00:00.000Z','watch','tt0000002',NULL,90)")
+        con.execute("INSERT INTO watched_episodes(history_id, show_id, show_title, season, episode, "
+                    "ep_title, watched_at, action, runtime) VALUES(1,1,'Show A',1,1,'Pilot',"
+                    "'2025-05-02T10:00:00.000Z','watch',45)")
+        track.set_meta(con, "synced_at", "2026-10-07T00:00:00+02:00")
+        con.commit()
+        con.close()
+
+    def test_report_all_survives_undated_rows(self):
+        self.seed()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            track.cmd_report_all(argparse.Namespace())
+        text = out.getvalue()
+        self.assertIn("Celoživotní přehled", text)
+        self.assertIn("2025", text)
+        self.assertIn("bez data", text, "záznam z 1. 1. 1970 se hlásí jako bez data")
+
+
 if __name__ == "__main__":
     unittest.main()
